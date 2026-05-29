@@ -29,5 +29,3 @@ if __name__ == "__main__":
         file=sys.stderr,
     )
     mcp.run(transport="sse")
-    )
-    mcp.run(transport="sse")
