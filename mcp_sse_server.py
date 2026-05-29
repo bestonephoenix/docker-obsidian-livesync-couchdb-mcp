@@ -24,5 +24,12 @@ if __name__ == "__main__":
 
     print(f"Obsidian MCP server starting on {host}:{port}/sse", file=sys.stderr)
 
-    # Bypass mcp.run() — use uvicorn directly with mcp's SSE app
-    uvicorn.run(mcp.sse_app(), host=host, port=port, log_level="info")
+    # Bypass mcp.run() — use uvicorn directly with mcp's SSE app.
+    # proxy_headers=False disables Host header validation (required for Docker).
+    uvicorn.run(
+        mcp.sse_app(),
+        host=host,
+        port=port,
+        proxy_headers=False,
+        log_level="info",
+    )
