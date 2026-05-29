@@ -22,6 +22,8 @@ RUN apt-get update && apt-get install -y \
 RUN python3 -m venv /opt/venv && \
     /opt/venv/bin/pip install obsidian-self-mcp
 
+# __ Removed Livesync since MCP can speak directly to the DB ____________
+
 # ── Our files ──────────────────────────────────────────────────────────
 COPY mcp_sse_server.py /scripts/mcp_sse_server.py
 COPY supervisord.conf /etc/supervisor/conf.d/obsidian.conf
