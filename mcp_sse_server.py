@@ -8,9 +8,11 @@ on an HTTP port, so external MCP clients (Claude Desktop, Hermes, etc.)
 can connect over the network.
 
 Agents connect at: http://<host>:8000/sse
+
+Host/port are read from FASTMCP_HOST / FASTMCP_PORT env vars
+(FastMCP uses pydantic-settings with FASTMCP_ prefix).
 """
 
-import os
 import sys
 
 # Import the FastMCP instance — all @mcp.tool() decorators
@@ -18,12 +20,13 @@ import sys
 from obsidian_self_mcp.server import mcp
 
 if __name__ == "__main__":
-    port = int(os.environ.get("MCP_PORT", "8000"))
-    host = os.environ.get("MCP_HOST", "0.0.0.0")
-
-    # Set host/port on settings, then start SSE transport
-    mcp.settings.host = host
-    mcp.settings.port = port
-
+    # FastMCP reads FASTMCP_HOST/FASTMCP_PORT from env (set in supervisord.conf).
+    # No manual mcp.settings overrides needed — pydantic-settings handles it.
+    print(
+        f"Obsidian MCP server starting on "
+        f"{mcp.settings.host}:{mcp.settings.port}/sse",
+        file=sys.stderr,
+    )
+    mcp.run(transport="sse")
     print(f"Obsidian MCP server starting on {host}:{port}/sse", file=sys.stderr)
     mcp.run(transport="sse")
