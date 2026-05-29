@@ -8,15 +8,15 @@ Agents (Claude Desktop, Hermes, Cursor, etc.) connect to `http://<host>:8000/sse
 
 ```
 ┌──────────────────────────────────────────────┐
-│                 Docker Container              │
+│                 Docker Container             │
 │                                              │
 │  ┌──────────┐         ┌───────────────────┐  │
-│  │ CouchDB  │◄───────│  MCP SSE Server   │  │
+│  │ CouchDB  │◄─────-──│  MCP SSE Server   │  │
 │  │  :5984   │ local   │  :8000/sse        │  │
 │  │          │  HTTP   │                   │  │
 │  └────┬─────┘         └────────┬──────────┘  │
-│       │                        │              │
-└───────┼────────────────────────┼──────────────┘
+│       │                        │             │
+└───────┼────────────────────────┼─────────────┘
         │                        │
    Obsidian clients          AI agents
    (LiveSync plugin)    (Claude, Hermes, etc.)
