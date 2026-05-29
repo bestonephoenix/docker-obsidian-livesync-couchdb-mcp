@@ -2,18 +2,12 @@
 """
 MCP SSE server for Obsidian vault access via CouchDB LiveSync.
 
-Bypasses FastMCP's run() entirely — calls uvicorn directly with the
-SSE Starlette app, guaranteeing host="0.0.0.0" without pydantic-settings
-overhead.
-
 Agents connect at: http://<host>:8000/sse
 """
 
 import os
 import sys
 
-# These env vars are used by obsidian_self_mcp (CouchDB connection).
-# FastMCP host is handled directly by uvicorn below — no FASTMCP_HOST needed.
 from obsidian_self_mcp.server import mcp
 
 if __name__ == "__main__":
@@ -22,10 +16,15 @@ if __name__ == "__main__":
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("MCP_PORT", "8000"))
 
-    print(f"Obsidian MCP server starting on {host}:{port}/sse", file=sys.stderr)
+    # Disable MCP SDK's DNS rebinding protection — it rejects non-localhost
+    # Host headers (like Docker container names). Not needed inside Docker.
+    try:
+        mcp.settings.transport_security.enable_dns_rebinding_protection = False
+    except AttributeError:
+        # Older MCP SDK without transport_security settings
+        pass
 
-    # Bypass mcp.run() — use uvicorn directly with mcp's SSE app.
-    # proxy_headers=False disables Host header validation (required for Docker).
+    print(f"Obsidian MCP server starting on {host}:{port}/sse", file=sys.stderr)
     uvicorn.run(
         mcp.sse_app(),
         host=host,
