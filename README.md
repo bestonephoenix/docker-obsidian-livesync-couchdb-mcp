@@ -1,3 +1,120 @@
+# Obsidian LiveSync + MCP Server (CouchDB)
+
+**Single Docker container** running both **CouchDB for Obsidian LiveSync** and an **MCP SSE server** for AI agent vault access.
+
+Agents (Claude Desktop, Hermes, Cursor, etc.) connect to `http://<host>:8000/sse` and get full read/write/search access to your vault — no Obsidian app required, no separate MCP process to manage.
+
+## How it works
+
+```
+┌──────────────────────────────────────────────┐
+│                 Docker Container              │
+│                                              │
+│  ┌──────────┐         ┌───────────────────┐  │
+│  │ CouchDB  │◄───────│  MCP SSE Server   │  │
+│  │  :5984   │ local   │  :8000/sse        │  │
+│  │          │  HTTP   │                   │  │
+│  └────┬─────┘         └────────┬──────────┘  │
+│       │                        │              │
+└───────┼────────────────────────┼──────────────┘
+        │                        │
+   Obsidian clients          AI agents
+   (LiveSync plugin)    (Claude, Hermes, etc.)
+```
+
+- **CouchDB** (port 5984) stores your vault, synced by the [Obsidian LiveSync](https://github.com/vrtmrz/obsidian-livesync) plugin
+- **MCP SSE server** (port 8000) talks to CouchDB locally and exposes 13 tools over the [Model Context Protocol](https://modelcontextprotocol.io/)
+- Both run under **supervisord** as a single container
+
+## Quick start
+
+```bash
+git clone https://github.com/bestonephoenix/docker-obsidian-livesync-couchdb-mcp.git
+cd docker-obsidian-livesync-couchdb-mcp
+
+# Configure
+cp .env.example .env
+# Edit .env — set COUCHDB_PASSWORD at minimum
+
+# Build and run
+docker compose up -d --build
+```
+
+## Environment variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `SERVER_DOMAIN` | No | `localhost` | Domain for CouchDB setup URI |
+| `COUCHDB_USER` | No | `admin` | CouchDB admin username |
+| `COUCHDB_PASSWORD` | **Yes** | — | CouchDB admin password |
+| `COUCHDB_DATABASE` | No | `obsidian` | Database name for the vault |
+| `COUCHDB_PORT` | No | `5984` | Host port for CouchDB |
+| `MCP_PORT` | No | `8000` | Host port for MCP SSE endpoint |
+| `COUCHDB_DATA` | No | `./couchdb-data` | Persistent volume path |
+
+These are shared between CouchDB and the MCP server — set them once.
+
+## Connecting AI agents
+
+### Hermes Agent
+
+Add to your Hermes `config.yaml`:
+
+```yaml
+mcp_servers:
+  obsidian:
+    transport: sse
+    url: http://your-host:8000/sse
+```
+
+### Claude Desktop
+
+Add to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "obsidian": {
+      "command": "npx",
+      "args": ["-y", "@anthropic/mcp-client-sse"],
+      "env": {
+        "MCP_SERVER_URL": "http://your-host:8000/sse"
+      }
+    }
+  }
+}
+```
+
+### Any SSE-compatible MCP client
+
+Connect to: `http://<host>:8000/sse`
+
+## Available MCP tools
+
+All tools from [obsidian-self-mcp](https://github.com/suhasvemuri/obsidian-self-mcp) are exposed:
+
+| Tool | Description |
+|---|---|
+| `list_notes` | List notes with metadata, filter by folder |
+| `read_note` | Read full content of a note |
+| `write_note` | Create or update a note |
+| `search_notes` | Full-text search across vault |
+| `append_note` | Append content to an existing note |
+| `delete_note` | Delete a note and its chunks |
+| `list_folders` | List folders with note counts |
+| `read_frontmatter` | Read YAML frontmatter properties |
+| `update_frontmatter` | Set/update frontmatter (JSON input) |
+| `list_tags` | List all tags with occurrence counts |
+| `search_by_tag` | Find notes containing a tag |
+| `get_backlinks` | Find notes linking to a given note |
+| `get_outbound_links` | List wikilinks from a note |
+
+## What this builds on
+
+This project layers an MCP server on top of the excellent CouchDB configuration from [oleduc/docker-obsidian-livesync-couchdb](https://github.com/oleduc/docker-obsidian-livesync-couchdb), which automates CouchDB setup for Obsidian LiveSync by parsing the upstream `couchdb-init.sh` script.
+
+The MCP server tools are provided by [suhasvemuri/obsidian-self-mcp](https://github.com/suhasvemuri/obsidian-self-mcp), which handles all the LiveSync document/chunk format transparently — reading, writing, searching, and managing notes through CouchDB.
+
 # CouchDB Configuration for Obsidian LiveSync
 
 This repository provides a Docker container for configuring CouchDB specifically for use with [Obsidian LiveSync](https://github.com/vrtmrz/obsidian-livesync). It automates the setup process by parsing the bash script (`couchdb-init.sh`) provided by obsidian-livesync's maintainer and updating CouchDB's configuration file (`local.ini`) according to the settings the plugin needs.
@@ -19,103 +136,30 @@ To verify the updated configuration:
     Open your CouchDB dashboard (http://example.com:5984/_utils).
     Check that the settings are applied under /_node/_local/_config.
 
-## Docker Overview
+## Architecture notes
 
-This project uses a sophisticated CI/CD pipeline to ensure reliable Docker image builds and releases:
+- **ARM64** — builds for `linux/arm64` by default. For amd64, add `platform: linux/amd64` to docker-compose or build with `--platform`.
+- CouchDB data persists via Docker volume at `/opt/couchdb/data`.
+- The MCP server connects to CouchDB internally over `localhost:5984` — no external CouchDB exposure needed for agent access (but you typically want port 5984 mapped for your Obsidian clients to sync).
+- Uses **supervisord** as PID 1 to manage both CouchDB and the MCP SSE server.
 
-### Build Process
-- **Automated Testing**: Every push and pull request triggers compatibility tests using Deno to verify the upstream CouchDB initialization script
-- **Multi-Architecture Builds**: Docker images are built for both `linux/amd64` and `linux/arm64` platforms
-- **Efficient Caching**: Uses GitHub Actions cache to speed up subsequent builds
-- **Build Validation**: Images are built and tested on every commit, but only published on releases
+## Testing
 
-### CI/CD Workflow
-The workflow consists of two main jobs:
+The original CouchDB configuration tests are preserved:
 
-1. **Build Job** (runs on push/PR):
-   - Runs compatibility tests with upstream Obsidian LiveSync script
-   - Builds multi-platform Docker images 
-   - Uses GitHub Actions cache for efficiency
-   - Validates the build without publishing
-
-2. **Publish Job** (runs only on GitHub releases):
-   - Uses cached layers from the build job for fast rebuilds
-   - Publishes images to Docker Hub
-   - Signs images with Cosign for security
-   - Only runs when a new release is created on GitHub
-
-### Release Strategy
-- **Development**: All pushes trigger builds and tests, but no publishing
-- **Production**: Only GitHub releases trigger image publishing to Docker Hub
-- **Versioning**: Images are tagged using semantic versioning from GitHub releases
-- **Security**: All published images are signed and can be verified
-
-### Available Tags
-When you create a GitHub release (e.g., `v1.2.3`), the following tags are automatically created:
-- `latest`: Latest stable release
-- `1.2.3`: Exact version from release tag
-- `1.2`: Major.minor version
-- `1`: Major version only
-
-### Docker Hub Integration
-This repository is integrated with Docker Hub at [`oleduc/docker-obsidian-livesync-couchdb`](https://hub.docker.com/r/oleduc/docker-obsidian-livesync-couchdb):
-
-- **Automated Publishing**: GitHub Actions automatically pushes images to Docker Hub on releases
-- **Semantic Versioning**: Multiple tags are created for each release for flexible version pinning
-- **Multi-Architecture Manifests**: Docker Hub serves the appropriate image for your platform
-- **Description Sync**: Repository description and documentation are synced to Docker Hub
-- **Signed Images**: All published images are cryptographically signed with Cosign for security verification
-
-Architecture-specific tags are automatically handled by Docker's manifest lists.
-
-### Pulling the Docker Image
-To use the pre-built image, pull it from the container registry:
 ```bash
-docker pull docker.io/oleduc/docker-obsidian-livesync-couchdb:latest
-```
-
-**Multi-Architecture Support**: This image supports both AMD64 (x86_64) and ARM64 architectures, including Apple Silicon Macs, ARM-based servers, and other ARM64 devices. Docker will automatically pull the correct architecture for your platform.
-
-### Running the Container
-
-Run the container with CouchDB configured for Obsidian LiveSync:
-
-```
-docker run -d \
-  -e SERVER_DOMAIN=example.com \
-  -e COUCHDB_USER=username \
-  -e COUCHDB_PASSWORD=password \
-  -e COUCHDB_DATABASE=obsidian \
-  -p 5984:5984 \
-  docker.io/oleduc/docker-obsidian-livesync-couchdb:master
-```
-
-Or via docker-compose
-```yaml
-version: "3.8"
-
-services:
-  couchdb-obsidian-livesync:
-    image: docker.io/oleduc/docker-obsidian-livesync-couchdb:master
-    container_name: couchdb-obsidian-livesync
-    restart: always
-    environment:
-      SERVER_URL: ${SERVER_URL}
-      COUCHDB_USER: ${COUCHDB_USER}
-      COUCHDB_PASSWORD: ${COUCHDB_PASSWORD}
-      COUCHDB_DATABASE: ${COUCHDB_DATABASE}
-    ports:
-      - "${COUCHDB_PORT:-5984}:5984"
-    volumes:
-      - ${COUCHDB_DATA}:/opt/couchdb/data
+./run-compatibility-test.sh
 ```
 
 ## License
 
-This repository is licensed under the MIT License. Contributions are welcome!
+MIT — same as the upstream projects.
 
 ## Credits
 
-- [Obsidian LiveSync for the core synchronization functionality.](https://github.com/vrtmrz/obsidian-livesync)
-- [CouchDB for its awesome, distributed database solution.](https://couchdb.apache.org/)
-- [Obsidian for it's awesome note taking app.](https://obsidian.md/)
+- [vrtmrz/obsidian-livesync](https://github.com/vrtmrz/obsidian-livesync) — the sync engine that makes this all possible
+- [oleduc/docker-obsidian-livesync-couchdb](https://github.com/oleduc/docker-obsidian-livesync-couchdb) — the CouchDB container this builds on
+- [suhasvemuri/obsidian-self-mcp](https://github.com/suhasvemuri/obsidian-self-mcp) — the MCP server and CLI for Obsidian vaults via CouchDB
+- [Apache CouchDB](https://couchdb.apache.org/) — the database
+- [Obsidian](https://obsidian.md/) — the note-taking app
+  
