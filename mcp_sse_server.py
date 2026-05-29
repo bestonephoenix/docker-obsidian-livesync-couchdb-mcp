@@ -21,5 +21,9 @@ if __name__ == "__main__":
     port = int(os.environ.get("MCP_PORT", "8000"))
     host = os.environ.get("MCP_HOST", "0.0.0.0")
 
+    # Set host/port on settings, then start SSE transport
+    mcp.settings.host = host
+    mcp.settings.port = port
+
     print(f"Obsidian MCP server starting on {host}:{port}/sse", file=sys.stderr)
-    mcp.run(transport="sse", host=host, port=port)
+    mcp.run(transport="sse")
