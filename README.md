@@ -54,22 +54,36 @@ docker compose up -d --build
 
 These are shared between CouchDB and the MCP server — set them once.
 
-## Connecting AI agents
+### Encryption (optional — only if you use LiveSync E2E encryption)
 
-### Hermes Agent
+| Variable | Required | Description |
+|---|---|---|
+| `LIVESYNC_PASSPHRASE` | No | Auto-unlock on startup (alternative to header) |
+| `LIVESYNC_PBKDF2_SALT` | No | 64-char hex PBKDF2 salt. Auto-discovered if omitted. |
 
-Add to your Hermes `config.yaml`:
+These env vars are optional. The recommended approach is the HTTP header method below.
+
+## Encryption support
+
+### No encryption? Nothing to configure.
+
+If you don't use LiveSync's end-to-end encryption, the server works out of the box. Chunks without the `e_` flag are returned as-is — no decryption layer is involved.
+
+### Using encryption? Set one header.
+
+Add the passphrase to your MCP client config as an HTTP header. The server auto-discovers the PBKDF2 salt from CouchDB and decrypts transparently.
+
+**Hermes Agent** (`~/.hermes/config.yaml`):
 
 ```yaml
 mcp_servers:
   obsidian:
-    transport: sse
-    url: http://your-host:8000/sse
+    url: "http://your-vps:8000/sse"
+    headers:
+      X-Livesync-Passphrase: "${LIVESYNC_PASSPHRASE}"
 ```
 
-### Claude Desktop
-
-Add to `claude_desktop_config.json`:
+**Claude Desktop** (`claude_desktop_config.json`):
 
 ```json
 {
@@ -78,17 +92,33 @@ Add to `claude_desktop_config.json`:
       "command": "npx",
       "args": ["-y", "@anthropic/mcp-client-sse"],
       "env": {
-        "MCP_SERVER_URL": "http://your-host:8000/sse"
+        "MCP_SERVER_URL": "http://your-vps:8000/sse",
+        "MCP_HEADER_X_Livesync_Passphrase": "your-passphrase"
       }
     }
   }
 }
 ```
 
-### Any SSE-compatible MCP client
+### How it works
 
-Connect to: `http://<host>:8000/sse`
+1. MCP client sends `X-Livesync-Passphrase` header with every request
+2. `LiveSyncAuthMiddleware` captures it on the first request
+3. PBKDF2 salt is auto-discovered from CouchDB `_local/` documents
+4. All encrypted chunks (`e_: true`) are decrypted via PBKDF2 → HKDF → AES-256-GCM
+5. The passphrase stays in your client config — the agent never sees it
 
+If the header approach isn't supported by your client, the `unlock_vault(passphrase)` tool is available as a fallback (agent calls it once to unlock).
+
+### What you need
+
+Only your **encryption passphrase**. The PBKDF2 salt (a 64-character hex string generated when you first enabled encryption) is auto-discovered from your CouchDB instance. If auto-discovery fails, provide it explicitly:
+
+```
+X-Livesync-PBKDF2-Salt: "your-64-char-hex-salt"
+```
+
+Or via the fallback tool: `unlock_vault("passphrase", "64charhexsalt")`
 ## Available MCP tools
 
 All tools from [obsidian-self-mcp](https://github.com/suhasvemuri/obsidian-self-mcp) are exposed:
