@@ -1,8 +1,8 @@
 FROM oleduc/docker-obsidian-livesync-couchdb:latest
 
 # ── Metadata ──────────────────────────────────────────────────────────
-LABEL org.opencontainers.image.title="Obsidian LiveSync + MCP Server"
-LABEL org.opencontainers.image.description="Single-container CouchDB for Obsidian LiveSync with integrated MCP server for AI agent vault access — no app required"
+LABEL org.opencontainers.image.title="Obsidian LiveSync with MCP Server"
+LABEL org.opencontainers.image.description="A Docker container that configures CouchDB specifically for use with Obsidian LiveSync, automating the setup process by parsing the bash script provided by obsidian-livesync's maintainer with integrated MCP server for AI agent vault access"
 LABEL org.opencontainers.image.url="https://github.com/bestonephoenix/docker-obsidian-livesync-couchdb-mcp"
 LABEL org.opencontainers.image.source="https://github.com/bestonephoenix/docker-obsidian-livesync-couchdb-mcp"
 LABEL org.opencontainers.image.licenses="MIT"
