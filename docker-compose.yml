@@ -6,7 +6,7 @@ services:
     restart: unless-stopped
     ports:
       - "${COUCHDB_PORT:-5984}:5984"    # CouchDB / LiveSync sync endpoint
-      - "${MCP_PORT:-8000}:8000"         # MCP SSE endpoint (agents connect here)
+      - "${MCP_PORT:-8000}:8000"         # MCP SSE endpoint
     environment:
       - SERVER_DOMAIN=${SERVER_DOMAIN:-localhost}
       - COUCHDB_USER=${COUCHDB_USER:-admin}
