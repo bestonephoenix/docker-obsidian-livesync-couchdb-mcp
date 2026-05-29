@@ -13,10 +13,10 @@ Agents connect at: http://<host>:8000/sse
 import os
 import sys
 
-# Set FastMCP host/port BEFORE importing — pydantic-settings reads
-# FASTMCP_HOST / FASTMCP_PORT at import time.
-os.environ.setdefault("FASTMCP_HOST", os.environ.get("MCP_HOST", "0.0.0.0"))
-os.environ.setdefault("FASTMCP_PORT", os.environ.get("MCP_PORT", "8000"))
+# Force-set FastMCP host/port BEFORE importing — pydantic-settings reads
+# FASTMCP_HOST / FASTMCP_PORT at class-definition time.
+os.environ["FASTMCP_HOST"] = os.environ.get("MCP_HOST", "0.0.0.0")
+os.environ["FASTMCP_PORT"] = os.environ.get("MCP_PORT", "8000")
 
 # Import the FastMCP instance — all @mcp.tool() decorators
 # fire at import time, registering every tool automatically.
@@ -27,5 +27,7 @@ if __name__ == "__main__":
         f"Obsidian MCP server starting on "
         f"{mcp.settings.host}:{mcp.settings.port}/sse",
         file=sys.stderr,
+    )
+    mcp.run(transport="sse")
     )
     mcp.run(transport="sse")
