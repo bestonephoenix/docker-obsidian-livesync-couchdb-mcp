@@ -18,9 +18,10 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # ── MCP server (obsidian-self-mcp by @suhasvemuri) ────────────────────
+# Not on PyPI — install directly from GitHub
 # https://github.com/suhasvemuri/obsidian-self-mcp
 RUN python3 -m venv /opt/venv && \
-    /opt/venv/bin/pip install obsidian-self-mcp
+    /opt/venv/bin/pip install git+https://github.com/suhasvemuri/obsidian-self-mcp.git
 
 # __ Removed Livesync since MCP can speak directly to the DB ____________
 
