@@ -2,8 +2,8 @@
 """
 MCP SSE server for Obsidian vault access via CouchDB LiveSync.
 
-Decryption: pass passphrase via query parameter or HTTP header.
-Hermes SSE: use query parameter (http://host:8000/sse?passphrase=xxx)
+Decryption: pass passphrase via query parameter.
+Hermes config: url: "http://host:8000/sse?passphrase=xxx"
 
 Agents connect at: http://<host>:8000/sse
 """
@@ -12,13 +12,13 @@ import os
 import sys
 import logging
 from typing import Optional
+from urllib.parse import parse_qs
 
 # Force host BEFORE FastMCP import
 os.environ["FASTMCP_HOST"] = os.environ.get("MCP_HOST", "0.0.0.0")
 os.environ["FASTMCP_PORT"] = os.environ.get("MCP_PORT", "8000")
 
-from starlette.requests import Request
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp, Scope, Receive, Send
 
 from obsidian_self_mcp.server import mcp, _get_client
 from obsidian_self_mcp.client import ObsidianVaultClient
@@ -64,46 +64,46 @@ async def _discover_pbkdf2_salt() -> Optional[str]:
     return None
 
 
-# ── Auth middleware ────────────────────────────────────────────────
+# ── ASGI middleware (raw — works with SSE streaming) ───────────────
 
-class LiveSyncAuthMiddleware(BaseHTTPMiddleware):
-    """Extract passphrase from header or query parameter on first request."""
+class LiveSyncAuthMiddleware:
+    """Extract passphrase from query string on first HTTP request."""
 
-    async def dispatch(self, request: Request, call_next):
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
         global _pbkdf2_salt, _credentials
 
-        if not _credentials:
-            # Check header first, then query parameter (Hermes SSE compat)
-            passphrase = request.headers.get("X-Livesync-Passphrase", "")
+        if scope["type"] == "http" and not _credentials:
+            query_string = scope.get("query_string", b"").decode("latin-1")
+            params = parse_qs(query_string)
+            passphrase = params.get("passphrase", [None])[0]
+            # Also check headers
             if not passphrase:
-                passphrase = request.query_params.get("passphrase", "")
-            logging.info(
-                "Auth check: header=%s query=%s url=%s",
-                bool(request.headers.get("X-Livesync-Passphrase")),
-                dict(request.query_params),
-                str(request.url),
-            )
+                for key, val in scope.get("headers", []):
+                    if key.decode("latin-1").lower() == "x-livesync-passphrase":
+                        passphrase = val.decode("latin-1")
+                        break
+
             if passphrase:
-                salt = request.headers.get("X-Livesync-PBKDF2-Salt", "")
-                if not salt and not _pbkdf2_salt:
+                if not _pbkdf2_salt:
                     _pbkdf2_salt = await _discover_pbkdf2_salt()
                 if _pbkdf2_salt:
                     _credentials = {
                         "passphrase": passphrase,
-                        "pbkdf2_salt": salt or _pbkdf2_salt,
+                        "pbkdf2_salt": _pbkdf2_salt,
                     }
-                    logging.info("Vault unlocked (auto-discovered salt)")
+                    logging.info("Vault unlocked via query param (auto-discovered salt)")
 
-        return await call_next(request)
+        await self.app(scope, receive, send)
 
 
 # ── Fallback: unlock_vault tool ────────────────────────────────────
 
 @mcp.tool()
 async def unlock_vault(passphrase: str, pbkdf2_salt: str = "") -> str:
-    """Unlock encrypted vault with your passphrase (fallback if headers not supported).
-
-    Use X-Livesync-Passphrase header in MCP client config instead if possible.
+    """Unlock encrypted vault with your passphrase (fallback).
 
     Args:
         passphrase: Your LiveSync encryption passphrase.
@@ -161,7 +161,7 @@ async def _patched_fetch_chunks(self, chunk_ids):
                         )
                 else:
                     data = (
-                        "[ENCRYPTED — set passphrase in URL "
+                        "[ENCRYPTED — add ?passphrase=xxx to URL "
                         "or call unlock_vault(passphrase)]"
                     )
             result[row["id"]] = data
@@ -184,7 +184,7 @@ if __name__ == "__main__":
     except AttributeError:
         pass
 
-    # Build SSE app and add our auth middleware
+    # Build SSE app with raw ASGI middleware (BaseHTTPMiddleware breaks SSE)
     app = mcp.sse_app()
     app.add_middleware(LiveSyncAuthMiddleware)
 
