@@ -184,9 +184,10 @@ if __name__ == "__main__":
     except AttributeError:
         pass
 
-    # Build SSE app with raw ASGI middleware (BaseHTTPMiddleware breaks SSE)
+    # Build SSE app and wrap with raw ASGI middleware
+    # (add_middleware may not rebuild correctly on already-built apps)
     app = mcp.sse_app()
-    app.add_middleware(LiveSyncAuthMiddleware)
+    app = LiveSyncAuthMiddleware(app)
 
     print(f"Obsidian MCP server starting on {host}:{port}/sse", file=sys.stderr)
     if not _credentials:
