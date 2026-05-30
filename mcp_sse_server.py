@@ -2,10 +2,8 @@
 """
 MCP SSE server for Obsidian vault access via CouchDB LiveSync.
 
-Decryption: set X-Livesync-Passphrase header in your MCP client config.
-The PBKDF2 salt is auto-discovered from CouchDB.
-
-Fallback: call unlock_vault(passphrase) tool if headers aren't supported.
+Decryption: pass passphrase via query parameter or HTTP header.
+Hermes SSE: use query parameter (http://host:8000/sse?passphrase=xxx)
 
 Agents connect at: http://<host>:8000/sse
 """
@@ -66,21 +64,19 @@ async def _discover_pbkdf2_salt() -> Optional[str]:
     return None
 
 
-# ── Auth middleware (reads X-Livesync-Passphrase header) ────────────
+# ── Auth middleware (reads passphrase from header or query param) ───
 
 class LiveSyncAuthMiddleware(BaseHTTPMiddleware):
-    """Extract passphrase from X-Livesync-Passphrase header on first request."""
+    """Extract passphrase from header or query parameter on first request."""
 
     async def dispatch(self, request: Request, call_next):
         global _pbkdf2_salt, _credentials
 
         if not _credentials:
-            # DEBUG: log all incoming headers to diagnose header passthrough
-            header_keys = list(request.headers.keys())
-            logging.info(
-                "Auth middleware: credentials empty, headers received: %s", header_keys
-            )
+            # Check header first, then query parameter (Hermes SSE compat)
             passphrase = request.headers.get("X-Livesync-Passphrase", "")
+            if not passphrase:
+                passphrase = request.query_params.get("passphrase", "")
             if passphrase:
                 salt = request.headers.get("X-Livesync-PBKDF2-Salt", "")
                 if not salt and not _pbkdf2_salt:
@@ -90,7 +86,7 @@ class LiveSyncAuthMiddleware(BaseHTTPMiddleware):
                         "passphrase": passphrase,
                         "pbkdf2_salt": salt or _pbkdf2_salt,
                     }
-                    logging.info("Vault unlocked via header (auto-discovered salt)")
+                    logging.info("Vault unlocked (auto-discovered salt)")
 
         return await call_next(request)
 
@@ -159,7 +155,7 @@ async def _patched_fetch_chunks(self, chunk_ids):
                         )
                 else:
                     data = (
-                        "[ENCRYPTED — set X-Livesync-Passphrase header "
+                        "[ENCRYPTED — set passphrase in URL "
                         "or call unlock_vault(passphrase)]"
                     )
             result[row["id"]] = data
@@ -189,7 +185,7 @@ if __name__ == "__main__":
     print(f"Obsidian MCP server starting on {host}:{port}/sse", file=sys.stderr)
     if not _credentials:
         print(
-            "Vault is ENCRYPTED — set X-Livesync-Passphrase header to auto-unlock",
+            "Vault is ENCRYPTED — add ?passphrase=xxx to URL or call unlock_vault()",
             file=sys.stderr,
         )
 
