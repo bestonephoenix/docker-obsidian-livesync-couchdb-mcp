@@ -3,7 +3,7 @@
 MCP SSE server for Obsidian vault access via CouchDB LiveSync.
 
 Passphrase via LIVESYNC_PASSPHRASE env var only.
-PBKDF2 salt auto-discovered from CouchDB at startup with retry.
+PBKDF2 salt auto-discovered from CouchDB sync params at startup.
 No passphrase ever touches the agent.
 
 Agents connect at: http://<host>:8000/sse
@@ -30,26 +30,22 @@ _credentials: dict = {}
 # ── Auto-discover PBKDF2 salt from CouchDB ────────────────────────
 
 async def _discover_pbkdf2_salt() -> Optional[str]:
-    """Find PBKDF2 salt in CouchDB _local/ documents (64-char hex string)."""
+    """Find PBKDF2 salt from CouchDB sync params document (base64-encoded)."""
+    import base64
+
     vault_client = _get_client()
     http = await vault_client._get_client()
-    resp = await http.get(
-        "/_all_docs",
-        params={
-            "startkey": '"_local/"',
-            "endkey": '"_local0"',
-            "include_docs": "true",
-        },
-    )
-    resp.raise_for_status()
-    for row in resp.json().get("rows", []):
-        doc = row.get("doc", {})
-        for val in doc.values():
-            if isinstance(val, str) and len(val) == 64:
-                if all(c in "0123456789abcdefABCDEF" for c in val):
-                    logging.info("Auto-discovered PBKDF2 salt from doc: %s", row["id"])
-                    return val
-    return None
+    resp = await http.get("_local/obsidian_livesync_sync_parameters")
+    if resp.status_code != 200:
+        logging.warning("Sync params doc not found (status %s)", resp.status_code)
+        return None
+    doc = resp.json()
+    salt_b64 = doc.get("pbkdf2salt", "")
+    if not salt_b64:
+        logging.warning("pbkdf2salt field not found in sync params")
+        return None
+    salt_bytes = base64.b64decode(salt_b64)
+    return salt_bytes.hex()
 
 
 # ── Patch _fetch_chunks for decryption ─────────────────────────────
