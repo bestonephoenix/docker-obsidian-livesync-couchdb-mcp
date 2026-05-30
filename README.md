@@ -1,30 +1,31 @@
 # Obsidian LiveSync + MCP Server (CouchDB)
 
-**Single Docker container** running both **CouchDB for Obsidian LiveSync** and an **MCP SSE server** for AI agent vault access.
+**Single Docker container** running **CouchDB for Obsidian LiveSync** and an **MCP SSE server** for AI agent vault access — with full encryption support.
 
-Agents (Claude Desktop, Hermes, Cursor, etc.) connect to `http://<host>:8000/sse` and get full read/write/search access to your vault — no Obsidian app required, no separate MCP process to manage.
+Agents (Claude Desktop, Hermes, Cursor, etc.) connect to `http://<host>:8000/sse` and get full read/write/search access to your vault. Encrypted vaults work via header-based auto-unlock — no passphrase ever reaches the agent.
 
 ## How it works
 
 ```
 ┌──────────────────────────────────────────────┐
-│                 Docker Container             │
+│                 Docker Container              │
 │                                              │
 │  ┌──────────┐         ┌───────────────────┐  │
-│  │ CouchDB  │◄─────-──│  MCP SSE Server   │  │
+│  │ CouchDB  │◄───────│  MCP SSE Server   │  │
 │  │  :5984   │ local   │  :8000/sse        │  │
 │  │          │  HTTP   │                   │  │
 │  └────┬─────┘         └────────┬──────────┘  │
-│       │                        │             │
-└───────┼────────────────────────┼─────────────┘
+│       │                        │              │
+└───────┼────────────────────────┼──────────────┘
         │                        │
    Obsidian clients          AI agents
    (LiveSync plugin)    (Claude, Hermes, etc.)
 ```
 
 - **CouchDB** (port 5984) stores your vault, synced by the [Obsidian LiveSync](https://github.com/vrtmrz/obsidian-livesync) plugin
-- **MCP SSE server** (port 8000) talks to CouchDB locally and exposes 13 tools over the [Model Context Protocol](https://modelcontextprotocol.io/)
+- **MCP SSE server** (port 8000) talks to CouchDB locally and exposes 14 tools over the [Model Context Protocol](https://modelcontextprotocol.io/)
 - Both run under **supervisord** as a single container
+- **End-to-end encryption** fully supported — auto-unlock via HTTP header, passphrase never touches the LLM
 
 ## Quick start
 
@@ -51,17 +52,6 @@ docker compose up -d --build
 | `COUCHDB_PORT` | No | `5984` | Host port for CouchDB |
 | `MCP_PORT` | No | `8000` | Host port for MCP SSE endpoint |
 | `COUCHDB_DATA` | No | `./couchdb-data` | Persistent volume path |
-
-These are shared between CouchDB and the MCP server — set them once.
-
-### Encryption (optional — only if you use LiveSync E2E encryption)
-
-| Variable | Required | Description |
-|---|---|---|
-| `LIVESYNC_PASSPHRASE` | No | Auto-unlock on startup (alternative to header) |
-| `LIVESYNC_PBKDF2_SALT` | No | 64-char hex PBKDF2 salt. Auto-discovered if omitted. |
-
-These env vars are optional. The recommended approach is the HTTP header method below.
 
 ## Encryption support
 
@@ -119,12 +109,14 @@ X-Livesync-PBKDF2-Salt: "your-64-char-hex-salt"
 ```
 
 Or via the fallback tool: `unlock_vault("passphrase", "64charhexsalt")`
+
 ## Available MCP tools
 
-All tools from [obsidian-self-mcp](https://github.com/suhasvemuri/obsidian-self-mcp) are exposed:
+All tools from [obsidian-self-mcp](https://github.com/suhasvemuri/obsidian-self-mcp) plus one extra:
 
 | Tool | Description |
 |---|---|
+| `unlock_vault` | **NEW** — unlock encrypted vault (fallback if headers not supported) |
 | `list_notes` | List notes with metadata, filter by folder |
 | `read_note` | Read full content of a note |
 | `write_note` | Create or update a note |
@@ -141,37 +133,19 @@ All tools from [obsidian-self-mcp](https://github.com/suhasvemuri/obsidian-self-
 
 ## What this builds on
 
-This project layers an MCP server on top of the excellent CouchDB configuration from [oleduc/docker-obsidian-livesync-couchdb](https://github.com/oleduc/docker-obsidian-livesync-couchdb), which automates CouchDB setup for Obsidian LiveSync by parsing the upstream `couchdb-init.sh` script.
+This project layers an MCP server on top of the CouchDB configuration from [oleduc/docker-obsidian-livesync-couchdb](https://github.com/oleduc/docker-obsidian-livesync-couchdb), which automates CouchDB setup for Obsidian LiveSync.
 
-The MCP server tools are provided by [suhasvemuri/obsidian-self-mcp](https://github.com/suhasvemuri/obsidian-self-mcp), which handles all the LiveSync document/chunk format transparently — reading, writing, searching, and managing notes through CouchDB.
+MCP tools are provided by [suhasvemuri/obsidian-self-mcp](https://github.com/suhasvemuri/obsidian-self-mcp), which handles LiveSync's document/chunk format.
 
-# CouchDB Configuration for Obsidian LiveSync
-
-This repository provides a Docker container for configuring CouchDB specifically for use with [Obsidian LiveSync](https://github.com/vrtmrz/obsidian-livesync). It automates the setup process by parsing the bash script (`couchdb-init.sh`) provided by obsidian-livesync's maintainer and updating CouchDB's configuration file (`local.ini`) according to the settings the plugin needs.
-
-The container is built and published automatically via GitHub Actions.
-
-[Docker Hub Page](https://hub.docker.com/r/oleduc/docker-obsidian-livesync-couchdb)
-
-## Features
-- **Automated CouchDB Configuration**: Extracts necessary settings for Obsidian LiveSync from the bash script created by the plugin maintainer.
-- **Build time configuration**: Configures couchDB at build time via configuration files instead of using couchDB APIs which simplifies the process.
-- **Multi-Architecture Support**: Native support for both AMD64 (x86_64) and ARM64 architectures, including Apple Silicon Macs.
-- **Auto-Publishing**: Docker images are automatically built and pushed to a container registry via GitHub Actions.
-
-## Testing Configuration
-
-To verify the updated configuration:
-
-    Open your CouchDB dashboard (http://example.com:5984/_utils).
-    Check that the settings are applied under /_node/_local/_config.
+Encryption decryption implements the HKDF-based AES-256-GCM scheme from [vrtmrz/octagonal-wheels](https://github.com/vrtmrz/octagonal-wheels) (the LiveSync encryption library), reimplemented in Python using `cryptography`.
 
 ## Architecture notes
 
-- **ARM64** — builds for `linux/arm64` by default. For amd64, add `platform: linux/amd64` to docker-compose or build with `--platform`.
+- **ARM64** — builds for `linux/arm64` by default. For amd64, add `platform: linux/amd64` to docker-compose.
 - CouchDB data persists via Docker volume at `/opt/couchdb/data`.
-- The MCP server connects to CouchDB internally over `localhost:5984` — no external CouchDB exposure needed for agent access (but you typically want port 5984 mapped for your Obsidian clients to sync).
+- The MCP server connects to CouchDB internally over `localhost:5984`.
 - Uses **supervisord** as PID 1 to manage both CouchDB and the MCP SSE server.
+- Transport security (DNS rebinding protection) is disabled — safe inside Docker's network namespace.
 
 ## Testing
 
@@ -187,9 +161,9 @@ MIT — same as the upstream projects.
 
 ## Credits
 
-- [vrtmrz/obsidian-livesync](https://github.com/vrtmrz/obsidian-livesync) — the sync engine that makes this all possible
+- [vrtmrz/obsidian-livesync](https://github.com/vrtmrz/obsidian-livesync) — the sync engine
+- [vrtmrz/octagonal-wheels](https://github.com/vrtmrz/octagonal-wheels) — encryption library (reference implementation)
 - [oleduc/docker-obsidian-livesync-couchdb](https://github.com/oleduc/docker-obsidian-livesync-couchdb) — the CouchDB container this builds on
-- [suhasvemuri/obsidian-self-mcp](https://github.com/suhasvemuri/obsidian-self-mcp) — the MCP server and CLI for Obsidian vaults via CouchDB
+- [suhasvemuri/obsidian-self-mcp](https://github.com/suhasvemuri/obsidian-self-mcp) — MCP server and CLI
 - [Apache CouchDB](https://couchdb.apache.org/) — the database
 - [Obsidian](https://obsidian.md/) — the note-taking app
-  
