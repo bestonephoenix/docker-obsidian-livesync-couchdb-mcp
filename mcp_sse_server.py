@@ -3,7 +3,7 @@
 MCP SSE server for Obsidian vault access via CouchDB LiveSync.
 
 Passphrase via LIVESYNC_PASSPHRASE env var only.
-PBKDF2 salt auto-discovered from CouchDB at startup.
+PBKDF2 salt auto-discovered from CouchDB at startup with retry.
 No passphrase ever touches the agent.
 
 Agents connect at: http://<host>:8000/sse
@@ -31,29 +31,24 @@ _credentials: dict = {}
 
 async def _discover_pbkdf2_salt() -> Optional[str]:
     """Find PBKDF2 salt in CouchDB _local/ documents (64-char hex string)."""
-    try:
-        vault_client = _get_client()
-        http = await vault_client._get_client()
-        resp = await http.get(
-            "/_all_docs",
-            params={
-                "startkey": '"_local/"',
-                "endkey": '"_local0"',
-                "include_docs": "true",
-            },
-        )
-        resp.raise_for_status()
-        for row in resp.json().get("rows", []):
-            doc = row.get("doc", {})
-            for val in doc.values():
-                if isinstance(val, str) and len(val) == 64:
-                    if all(c in "0123456789abcdefABCDEF" for c in val):
-                        logging.info(
-                            "Auto-discovered PBKDF2 salt from doc: %s", row["id"]
-                        )
-                        return val
-    except Exception as e:
-        logging.warning("Salt discovery failed: %s", e)
+    vault_client = _get_client()
+    http = await vault_client._get_client()
+    resp = await http.get(
+        "/_all_docs",
+        params={
+            "startkey": '"_local/"',
+            "endkey": '"_local0"',
+            "include_docs": "true",
+        },
+    )
+    resp.raise_for_status()
+    for row in resp.json().get("rows", []):
+        doc = row.get("doc", {})
+        for val in doc.values():
+            if isinstance(val, str) and len(val) == 64:
+                if all(c in "0123456789abcdefABCDEF" for c in val):
+                    logging.info("Auto-discovered PBKDF2 salt from doc: %s", row["id"])
+                    return val
     return None
 
 
@@ -89,23 +84,52 @@ async def _patched_fetch_chunks(self, chunk_ids):
                         data = f"[DECRYPT FAILED: {e}]"
                         logging.warning("Decrypt failed for chunk %s: %s", row["id"], e)
                 else:
-                    data = (
-                        "[ENCRYPTED — set LIVESYNC_PASSPHRASE env var "
-                        "and restart the container]"
-                    )
+                    data = "[ENCRYPTED — restart container with LIVESYNC_PASSPHRASE]"
             result[row["id"]] = data
     return result
 
 
 ObsidianVaultClient._fetch_chunks = _patched_fetch_chunks
 
-# ── Start server ───────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    import uvicorn
+# ── Startup (async — handles retry for CouchDB readiness) ─────────
 
-    host = os.environ.get("MCP_HOST", "0.0.0.0")
-    port = int(os.environ.get("MCP_PORT", "8000"))
+async def _startup():
+    """Discover salt, unlock vault, return the SSE app."""
+    global _credentials
+
+    passphrase = os.environ.get("LIVESYNC_PASSPHRASE", "")
+    if passphrase:
+        salt = os.environ.get("LIVESYNC_PBKDF2_SALT", "")
+        if not salt:
+            print("Waiting for CouchDB...", file=sys.stderr, flush=True)
+            for attempt in range(1, 8):
+                await asyncio.sleep(3)
+                try:
+                    salt = await _discover_pbkdf2_salt()
+                    if salt:
+                        break
+                except Exception as e:
+                    print(f"  Attempt {attempt}/7: {e}", file=sys.stderr, flush=True)
+            else:
+                salt = None
+
+        if salt:
+            _credentials = {"passphrase": passphrase, "pbkdf2_salt": salt}
+            print("Vault UNLOCKED.", file=sys.stderr, flush=True)
+        else:
+            print(
+                "WARNING: Could not discover PBKDF2 salt. "
+                "Set LIVESYNC_PBKDF2_SALT if needed.",
+                file=sys.stderr,
+                flush=True,
+            )
+    else:
+        print(
+            "Vault is ENCRYPTED — set LIVESYNC_PASSPHRASE env var.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     # Disable MCP SDK DNS rebinding protection (Docker networking)
     try:
@@ -113,28 +137,18 @@ if __name__ == "__main__":
     except AttributeError:
         pass
 
-    # Auto-unlock: discover salt and set credentials at startup
-    passphrase = os.environ.get("LIVESYNC_PASSPHRASE", "")
-    if passphrase:
-        salt = os.environ.get("LIVESYNC_PBKDF2_SALT", "")
-        if not salt:
-            print("Discovering PBKDF2 salt from CouchDB...", file=sys.stderr)
-            salt = asyncio.run(_discover_pbkdf2_salt())
-        if salt:
-            _credentials = {"passphrase": passphrase, "pbkdf2_salt": salt}
-            print("Vault UNLOCKED — encryption passphrase set.", file=sys.stderr)
-        else:
-            print(
-                "WARNING: Could not discover PBKDF2 salt. "
-                "Set LIVESYNC_PBKDF2_SALT env var.",
-                file=sys.stderr,
-            )
-    else:
-        print(
-            "Vault is ENCRYPTED — set LIVESYNC_PASSPHRASE env var and restart.",
-            file=sys.stderr,
-        )
+    return mcp.sse_app()
 
-    app = mcp.sse_app()
+
+# ── Main ───────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import uvicorn
+
+    host = os.environ.get("MCP_HOST", "0.0.0.0")
+    port = int(os.environ.get("MCP_PORT", "8000"))
+
+    app = asyncio.run(_startup())
+
     print(f"Obsidian MCP server starting on {host}:{port}/sse", file=sys.stderr)
     uvicorn.run(app, host=host, port=port, proxy_headers=False, log_level="info")
