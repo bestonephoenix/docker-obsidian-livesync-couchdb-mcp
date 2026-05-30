@@ -117,11 +117,8 @@ async def _startup():
                 flush=True,
             )
     else:
-        print(
-            "Vault is ENCRYPTED — set LIVESYNC_PASSPHRASE env var.",
-            file=sys.stderr,
-            flush=True,
-        )
+        # Unencrypted vault — nothing to do, works out of the box
+        pass
 
     try:
         mcp.settings.transport_security.enable_dns_rebinding_protection = False
