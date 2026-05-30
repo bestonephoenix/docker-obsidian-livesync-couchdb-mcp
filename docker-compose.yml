@@ -5,12 +5,13 @@ services:
     container_name: obsidian-livesync-mcp
     restart: unless-stopped
     ports:
-      - "${COUCHDB_PORT:-5984}:5984"    # CouchDB / LiveSync sync endpoint
-      - "${MCP_PORT:-8000}:8000"         # MCP SSE endpoint
+      - "${COUCHDB_PORT:-5984}:5984"
+      - "${MCP_PORT:-8000}:8000"
     environment:
       - SERVER_DOMAIN=${SERVER_DOMAIN:-localhost}
       - COUCHDB_USER=${COUCHDB_USER:-admin}
       - COUCHDB_PASSWORD=${COUCHDB_PASSWORD}
       - COUCHDB_DATABASE=${COUCHDB_DATABASE:-obsidian}
+      - LIVESYNC_PASSPHRASE=${LIVESYNC_PASSPHRASE:-}
     volumes:
       - ${COUCHDB_DATA:-./couchdb-data}:/opt/couchdb/data
