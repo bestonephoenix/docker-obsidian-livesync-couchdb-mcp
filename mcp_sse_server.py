@@ -3,7 +3,7 @@
 MCP SSE server for Obsidian vault access via CouchDB LiveSync.
 
 Passphrase via LIVESYNC_PASSPHRASE env var only.
-PBKDF2 salt auto-discovered from CouchDB sync params at startup.
+PBKDF2 salt auto-discovered from CouchDB at startup with retry.
 No passphrase ever touches the agent.
 
 Agents connect at: http://<host>:8000/sse
@@ -11,7 +11,6 @@ Agents connect at: http://<host>:8000/sse
 
 import asyncio
 import os
-import sys
 import logging
 from typing import Optional
 
@@ -50,8 +49,6 @@ async def _discover_pbkdf2_salt() -> Optional[str]:
 
 # ── Patch _fetch_chunks for decryption ─────────────────────────────
 
-_original_fetch = ObsidianVaultClient._fetch_chunks
-
 
 async def _patched_fetch_chunks(self, chunk_ids):
     httpx_client = await self._get_client()
@@ -69,7 +66,6 @@ async def _patched_fetch_chunks(self, chunk_ids):
             if doc.get("e_"):
                 if _credentials:
                     from livesync_decrypt import decrypt_chunk
-
                     try:
                         data = decrypt_chunk(
                             data,
@@ -127,7 +123,6 @@ async def _startup():
             flush=True,
         )
 
-    # Disable MCP SDK DNS rebinding protection (Docker networking)
     try:
         mcp.settings.transport_security.enable_dns_rebinding_protection = False
     except AttributeError:
@@ -135,8 +130,6 @@ async def _startup():
 
     return mcp.sse_app()
 
-
-# ── Main ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
