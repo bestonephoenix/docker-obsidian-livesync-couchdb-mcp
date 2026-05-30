@@ -75,6 +75,11 @@ class LiveSyncAuthMiddleware(BaseHTTPMiddleware):
         global _pbkdf2_salt, _credentials
 
         if not _credentials:
+            # DEBUG: log all incoming headers to diagnose header passthrough
+            header_keys = list(request.headers.keys())
+            logging.info(
+                "Auth middleware: credentials empty, headers received: %s", header_keys
+            )
             passphrase = request.headers.get("X-Livesync-Passphrase", "")
             if passphrase:
                 salt = request.headers.get("X-Livesync-PBKDF2-Salt", "")
