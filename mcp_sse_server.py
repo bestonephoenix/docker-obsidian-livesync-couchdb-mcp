@@ -64,7 +64,7 @@ async def _discover_pbkdf2_salt() -> Optional[str]:
     return None
 
 
-# ── Auth middleware (reads passphrase from header or query param) ───
+# ── Auth middleware ────────────────────────────────────────────────
 
 class LiveSyncAuthMiddleware(BaseHTTPMiddleware):
     """Extract passphrase from header or query parameter on first request."""
@@ -77,6 +77,12 @@ class LiveSyncAuthMiddleware(BaseHTTPMiddleware):
             passphrase = request.headers.get("X-Livesync-Passphrase", "")
             if not passphrase:
                 passphrase = request.query_params.get("passphrase", "")
+            logging.info(
+                "Auth check: header=%s query=%s url=%s",
+                bool(request.headers.get("X-Livesync-Passphrase")),
+                dict(request.query_params),
+                str(request.url),
+            )
             if passphrase:
                 salt = request.headers.get("X-Livesync-PBKDF2-Salt", "")
                 if not salt and not _pbkdf2_salt:
