@@ -3,7 +3,7 @@
 MCP StreamableHTTP server for Obsidian vault access via CouchDB LiveSync.
 
 Passphrase via X-Livesync-Passphrase HTTP header, with LIVESYNC_PASSPHRASE
-env var as fallback.
+env var as fallback. Salt always auto-discovered at startup.
 
 Agents connect at: http://<host>:8000/mcp (StreamableHTTP)
 """
@@ -30,7 +30,7 @@ def _get_passphrase() -> str:
     return passphrase_ctx.get() or os.environ.get("LIVESYNC_PASSPHRASE", "")
 
 
-# ── Step 4: full middleware (ContextVar set/reset added) ───────────
+# ── Middleware: extract passphrase from HTTP header ────────────────
 
 
 def _header_middleware(app):
@@ -52,7 +52,7 @@ def _header_middleware(app):
     return wrapper
 
 
-# ── Salt discovery ─────────────────────────────────────────────────
+# ── Salt discovery (always runs at startup) ────────────────────────
 
 async def _discover_pbkdf2_salt() -> Optional[str]:
     import base64
@@ -158,32 +158,39 @@ async def _patched_get_all_file_docs(self):
 ObsidianVaultClient._get_all_file_docs = _patched_get_all_file_docs
 
 
-# ── Startup ────────────────────────────────────────────────────────
+# ── Startup: always discover salt, regardless of passphrase source ─
 
 async def _startup():
     global _pbkdf2_salt
-    passphrase = os.environ.get("LIVESYNC_PASSPHRASE", "")
-    if passphrase:
-        salt = os.environ.get("LIVESYNC_PBKDF2_SALT", "")
-        if not salt:
-            print("Waiting for CouchDB...", file=sys.stderr, flush=True)
-            for attempt in range(1, 8):
-                await asyncio.sleep(3)
-                try:
-                    salt = await _discover_pbkdf2_salt()
-                    if salt:
-                        break
-                except Exception as e:
-                    print(f"  Attempt {attempt}/7: {e}", file=sys.stderr, flush=True)
-            else:
-                salt = None
-        if salt:
-            _pbkdf2_salt = salt
-            print("Vault UNLOCKED.", file=sys.stderr, flush=True)
+
+    salt = os.environ.get("LIVESYNC_PBKDF2_SALT", "")
+    if not salt:
+        print("Discovering PBKDF2 salt from CouchDB...", file=sys.stderr, flush=True)
+        for attempt in range(1, 8):
+            await asyncio.sleep(3)
+            try:
+                salt = await _discover_pbkdf2_salt()
+                if salt:
+                    break
+            except Exception as e:
+                print(f"  Attempt {attempt}/7: {e}", file=sys.stderr, flush=True)
+
+    if salt:
+        _pbkdf2_salt = salt
+        print("Salt discovered. Vault ready.", file=sys.stderr, flush=True)
+    else:
+        print(
+            "WARNING: Could not discover PBKDF2 salt. "
+            "Set LIVESYNC_PBKDF2_SALT if encryption is used.",
+            file=sys.stderr,
+            flush=True,
+        )
+
     try:
         mcp.settings.transport_security.enable_dns_rebinding_protection = False
     except AttributeError:
         pass
+
     return mcp.streamable_http_app()
 
 
@@ -194,7 +201,7 @@ if __name__ == "__main__":
     app = asyncio.run(_startup())
     app = _header_middleware(app)
     print(
-        f"Obsidian MCP server on {host}:{port}/mcp (Step 4: full middleware)",
+        f"Obsidian MCP server on {host}:{port}/mcp (StreamableHTTP + header auth)",
         file=sys.stderr,
     )
     uvicorn.run(app, host=host, port=port, proxy_headers=False, log_level="info")
