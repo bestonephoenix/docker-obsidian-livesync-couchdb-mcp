@@ -2,7 +2,8 @@
 """
 MCP StreamableHTTP server for Obsidian vault access via CouchDB LiveSync.
 
-Passphrase via LIVESYNC_PASSPHRASE env var.
+Passphrase via X-Livesync-Passphrase HTTP header, with LIVESYNC_PASSPHRASE
+env var as fallback.
 PBKDF2 salt auto-discovered from CouchDB at startup with retry.
 No passphrase ever touches the agent.
 
@@ -10,6 +11,7 @@ Agents connect at: http://<host>:8000/mcp (StreamableHTTP)
 """
 
 import asyncio
+import contextvars
 import logging
 import os
 import sys
@@ -22,14 +24,46 @@ os.environ["FASTMCP_PORT"] = os.environ.get("MCP_PORT", "8000")
 from obsidian_self_mcp.server import mcp, _get_client
 from obsidian_self_mcp.client import ObsidianVaultClient
 
+# ── Per-request passphrase (ContextVar, set by middleware) ─────────
+
+passphrase_ctx = contextvars.ContextVar("livesync_passphrase", default="")
+
 # ── Global salt (discovered once at startup) ──────────────────────
 
 _pbkdf2_salt: Optional[str] = None
 
 
 def _get_passphrase() -> str:
-    """Return passphrase from env var."""
-    return os.environ.get("LIVESYNC_PASSPHRASE", "")
+    """Return passphrase: ContextVar first (from header), then env var fallback."""
+    return passphrase_ctx.get() or os.environ.get("LIVESYNC_PASSPHRASE", "")
+
+
+# ── ASGI middleware: extract passphrase from HTTP header ───────────
+#
+# Raw ASGI passthrough — does NOT read response body, so SSE streaming
+# (GET /mcp → session establishment) works correctly.
+# BaseHTTPMiddleware is NOT used because it breaks SSE.
+
+
+def _passphrase_middleware(app):
+    """Wrap an ASGI app to extract X-Livesync-Passphrase header per request."""
+
+    async def asgi_wrapper(scope, receive, send):
+        if scope["type"] != "http":
+            await app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", []))
+        passphrase_bytes = headers.get(b"x-livesync-passphrase", b"")
+        passphrase = passphrase_bytes.decode() if passphrase_bytes else ""
+
+        token = passphrase_ctx.set(passphrase)
+        try:
+            await app(scope, receive, send)
+        finally:
+            passphrase_ctx.reset(token)
+
+    return asgi_wrapper
 
 
 # ── Auto-discover PBKDF2 salt from CouchDB ────────────────────────
@@ -79,7 +113,10 @@ async def _patched_fetch_chunks(self, chunk_ids):
                         data = f"[DECRYPT FAILED: {e}]"
                         logging.warning("Decrypt failed for chunk %s: %s", row["id"], e)
                 else:
-                    data = "[ENCRYPTED — set LIVESYNC_PASSPHRASE env var]"
+                    data = (
+                        "[ENCRYPTED — set X-Livesync-Passphrase header"
+                        " or LIVESYNC_PASSPHRASE env var]"
+                    )
             result[row["id"]] = data
     return result
 
@@ -250,9 +287,11 @@ if __name__ == "__main__":
     port = int(os.environ.get("MCP_PORT", "8000"))
 
     app = asyncio.run(_startup())
+    app = _passphrase_middleware(app)
 
     print(
-        f"Obsidian MCP server starting on {host}:{port}/mcp (StreamableHTTP)",
+        f"Obsidian MCP server starting on {host}:{port}/mcp"
+        " (StreamableHTTP + header auth)",
         file=sys.stderr,
     )
     uvicorn.run(app, host=host, port=port, proxy_headers=False, log_level="info")
