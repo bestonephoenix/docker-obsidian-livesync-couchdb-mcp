@@ -31,40 +31,27 @@ _pbkdf2_salt: Optional[str] = None
 
 
 def _get_passphrase() -> str:
-    """Return passphrase: ContextVar first (from header), then env var fallback."""
     return passphrase_ctx.get() or os.environ.get("LIVESYNC_PASSPHRASE", "")
 
 
-# ── ASGI middleware: extract passphrase from HTTP header ───────────
-
-
 def _header_middleware(app):
-    """Wrap an ASGI app to extract X-Livesync-Passphrase header per request."""
-
     async def wrapper(scope, receive, send):
         if scope["type"] != "http":
             await app(scope, receive, send)
             return
-
         headers = dict(scope.get("headers", []))
         passphrase_bytes = headers.get(b"x-livesync-passphrase", b"")
         passphrase = passphrase_bytes.decode() if passphrase_bytes else ""
-
         token = passphrase_ctx.set(passphrase)
         try:
             await app(scope, receive, send)
         finally:
             passphrase_ctx.reset(token)
-
     return wrapper
 
 
-# ── Salt discovery (always runs at startup) ────────────────────────
-
 async def _discover_pbkdf2_salt() -> Optional[str]:
-    """Find PBKDF2 salt from CouchDB sync params document (base64-encoded)."""
     import base64
-
     vault_client = _get_client()
     http = await vault_client._get_client()
     resp = await http.get("_local/obsidian_livesync_sync_parameters")
@@ -76,19 +63,13 @@ async def _discover_pbkdf2_salt() -> Optional[str]:
     if not salt_b64:
         logging.warning("pbkdf2salt field not found in sync params")
         return None
-    salt_bytes = base64.b64decode(salt_b64)
-    return salt_bytes.hex()
-
-
-# ── Patch _fetch_chunks for decryption ─────────────────────────────
+    return base64.b64decode(salt_b64).hex()
 
 
 async def _patched_fetch_chunks(self, chunk_ids):
     httpx_client = await self._get_client()
     resp = await httpx_client.post(
-        "/_all_docs",
-        json={"keys": chunk_ids},
-        params={"include_docs": "true"},
+        "/_all_docs", json={"keys": chunk_ids}, params={"include_docs": "true"}
     )
     resp.raise_for_status()
     result = {}
@@ -100,71 +81,52 @@ async def _patched_fetch_chunks(self, chunk_ids):
             if doc.get("e_"):
                 if passphrase and _pbkdf2_salt:
                     from livesync_decrypt import decrypt_chunk
-
                     try:
                         data = decrypt_chunk(data, passphrase, _pbkdf2_salt)
                     except Exception as e:
                         data = f"[DECRYPT FAILED: {e}]"
-                        logging.warning(
-                            "Decrypt failed for chunk %s: %s", row["id"], e
-                        )
+                        logging.warning("Decrypt failed for chunk %s: %s", row["id"], e)
                 else:
-                    data = (
-                        "[ENCRYPTED — set X-Livesync-Passphrase header"
-                        " or LIVESYNC_PASSPHRASE env var]"
-                    )
+                    data = "[ENCRYPTED — set passphrase (header or env)]"
             result[row["id"]] = data
     return result
-
 
 ObsidianVaultClient._fetch_chunks = _patched_fetch_chunks
 
 
-# ── Patch _get_all_file_docs: dedup by filename, filter ghosts ────
+# ── Patch _get_all_file_docs: dedup by filename, prefer folders ───
 
 _LIVESYNC_INTERNAL_PREFIXES = ("i:", "ps:", "ix:", "_design/", "_local/")
 
 
 async def _patched_get_all_file_docs(self):
-    """Fetch all file docs (skip chunks, design docs, index docs).
+    """Fetch all file docs with deduplication and ghost filtering.
 
-    Patched to:
-    1. Exclude LiveSync internal metadata prefixes (i:, ps:, ix:)
-    2. Exclude CouchDB system docs (_design/, _local/)
-    3. Exclude deleted documents
-    4. Exclude ghost files (empty children — parent doc with zero chunks)
-    5. Deduplicate by base filename — keeps the entry with the highest mtime.
-       This handles files that were moved between folders (root → subfolder)
-       where the old CouchDB doc with the old path persists alongside the new one.
+    1. Exclude LiveSync internal metadata and CouchDB system docs
+    2. Exclude deleted documents
+    3. Exclude ghost files (empty children)
+    4. Deduplicate by base filename:
+       - If same filename exists at root AND in a folder → keep folder version
+       - If multiple folder versions exist → keep highest mtime
+       - If only root version exists → keep it (legitimate root file)
     """
     httpx_client = await self._get_client()
-
     all_rows = []
 
-    # Range 1: docs before "h:" (excludes all chunk IDs)
     resp = await httpx_client.get(
         "/_all_docs",
-        params={
-            "include_docs": "true",
-            "endkey": '"h:"',
-            "inclusive_end": "false",
-        },
+        params={"include_docs": "true", "endkey": '"h:"', "inclusive_end": "false"},
     )
     resp.raise_for_status()
     all_rows.extend(resp.json().get("rows", []))
 
-    # Range 2: docs after "h:~" (after all possible chunk IDs)
     resp = await httpx_client.get(
         "/_all_docs",
-        params={
-            "include_docs": "true",
-            "startkey": '"h:~"',
-        },
+        params={"include_docs": "true", "startkey": '"h:~"'},
     )
     resp.raise_for_status()
     all_rows.extend(resp.json().get("rows", []))
 
-    # Process with deduplication by base filename
     seen: dict[str, dict] = {}
     skipped_deleted = 0
     skipped_internal = 0
@@ -175,45 +137,43 @@ async def _patched_get_all_file_docs(self):
         doc = row.get("doc")
         if not doc:
             continue
-
-        # Skip deleted documents (check both doc._deleted and row.value.deleted)
         if doc.get("_deleted") or row.get("value", {}).get("deleted"):
             skipped_deleted += 1
             continue
-
-        # Skip non-file docs (must have type and children)
         if doc.get("type") not in ("plain", "newnote") or "children" not in doc:
             continue
-
-        # Skip ghost files (parent doc with zero chunks — orphaned entry)
         if not doc.get("children"):
             skipped_ghost += 1
             continue
 
         doc_id = doc.get("_id", "")
-
-        # Skip LiveSync internal metadata and CouchDB system docs
         if any(doc_id.startswith(p) for p in _LIVESYNC_INTERNAL_PREFIXES):
             skipped_internal += 1
             continue
 
-        # Deduplicate by base filename, keep highest mtime.
-        # Uses filename (last path segment) as the dedup key so files
-        # moved between folders (e.g. root → subfolder) collapse to one entry.
         path = doc.get("path", doc_id)
         filename = path.rsplit("/", 1)[-1]
+        in_folder = "/" in path
+        mtime = doc.get("mtime", 0)
 
         existing = seen.get(filename)
-        if existing is None or doc.get("mtime", 0) > existing.get("mtime", 0):
-            if existing is not None:
-                skipped_duplicate += 1
-                logging.debug(
-                    "Dedup: keeping %s over %s (mtime %s > %s)",
-                    path,
-                    existing.get("path", existing.get("_id")),
-                    doc.get("mtime"),
-                    existing.get("mtime"),
-                )
+        if existing is None:
+            seen[filename] = doc
+            continue
+
+        existing_in_folder = "/" in existing.get("path", existing.get("_id", ""))
+        existing_mtime = existing.get("mtime", 0)
+
+        if in_folder and not existing_in_folder:
+            # New is in folder, existing is root → prefer folder
+            skipped_duplicate += 1
+            seen[filename] = doc
+        elif not in_folder and existing_in_folder:
+            # Existing is in folder, new is root → keep existing
+            skipped_duplicate += 1
+        elif mtime > existing_mtime:
+            # Both same category → higher mtime wins
+            skipped_duplicate += 1
             seen[filename] = doc
         else:
             skipped_duplicate += 1
@@ -221,26 +181,18 @@ async def _patched_get_all_file_docs(self):
     if skipped_deleted or skipped_internal or skipped_ghost or skipped_duplicate:
         logging.info(
             "_get_all_file_docs: filtered %d deleted, %d internal, "
-            "%d ghost, %d duplicate — %d unique file docs remain",
-            skipped_deleted,
-            skipped_internal,
-            skipped_ghost,
-            skipped_duplicate,
-            len(seen),
+            "%d ghost, %d duplicate — %d unique",
+            skipped_deleted, skipped_internal, skipped_ghost,
+            skipped_duplicate, len(seen),
         )
 
     return list(seen.values())
 
-
 ObsidianVaultClient._get_all_file_docs = _patched_get_all_file_docs
 
 
-# ── Startup: always discover salt, regardless of passphrase source ─
-
 async def _startup():
-    """Discover PBKDF2 salt, build and return the ASGI app."""
     global _pbkdf2_salt
-
     salt = os.environ.get("LIVESYNC_PBKDF2_SALT", "")
     if not salt:
         print("Discovering PBKDF2 salt from CouchDB...", file=sys.stderr, flush=True)
@@ -252,37 +204,23 @@ async def _startup():
                     break
             except Exception as e:
                 print(f"  Attempt {attempt}/7: {e}", file=sys.stderr, flush=True)
-
     if salt:
         _pbkdf2_salt = salt
         print("Salt discovered. Vault ready.", file=sys.stderr, flush=True)
     else:
-        print(
-            "WARNING: Could not discover PBKDF2 salt. "
-            "Set LIVESYNC_PBKDF2_SALT if encryption is used.",
-            file=sys.stderr,
-            flush=True,
-        )
-
+        print("WARNING: Could not discover PBKDF2 salt.", file=sys.stderr, flush=True)
     try:
         mcp.settings.transport_security.enable_dns_rebinding_protection = False
     except AttributeError:
         pass
-
     return mcp.streamable_http_app()
 
 
 if __name__ == "__main__":
     import uvicorn
-
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("MCP_PORT", "8000"))
-
     app = asyncio.run(_startup())
     app = _header_middleware(app)
-
-    print(
-        f"Obsidian MCP server starting on {host}:{port}/mcp (StreamableHTTP + header auth)",
-        file=sys.stderr,
-    )
+    print(f"Obsidian MCP server starting on {host}:{port}/mcp", file=sys.stderr)
     uvicorn.run(app, host=host, port=port, proxy_headers=False, log_level="info")
