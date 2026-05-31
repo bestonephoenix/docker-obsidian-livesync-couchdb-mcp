@@ -15,7 +15,7 @@ import os
 import sys
 from typing import Optional
 
-# Force host/port BEFORE FastMCP import — mcp.run() reads FASTMCP_HOST / FASTMCP_PORT
+# Force host BEFORE FastMCP import
 os.environ["FASTMCP_HOST"] = os.environ.get("MCP_HOST", "0.0.0.0")
 os.environ["FASTMCP_PORT"] = os.environ.get("MCP_PORT", "8000")
 
@@ -126,15 +126,19 @@ async def _startup():
     except AttributeError:
         pass
 
+    return mcp.streamable_http_app()
+
 
 if __name__ == "__main__":
-    asyncio.run(_startup())
+    import uvicorn
 
-    host = os.environ["FASTMCP_HOST"]
-    port = os.environ["FASTMCP_PORT"]
+    host = os.environ.get("MCP_HOST", "0.0.0.0")
+    port = int(os.environ.get("MCP_PORT", "8000"))
+
+    app = asyncio.run(_startup())
+
     print(
         f"Obsidian MCP server starting on {host}:{port}/mcp (StreamableHTTP)",
         file=sys.stderr,
     )
-    # host/port read from FASTMCP_HOST / FASTMCP_PORT env vars set above
-    mcp.run(transport="streamable-http")
+    uvicorn.run(app, host=host, port=port, proxy_headers=False, log_level="info")
