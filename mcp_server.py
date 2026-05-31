@@ -2,7 +2,8 @@
 """
 MCP StreamableHTTP server for Obsidian vault access via CouchDB LiveSync.
 
-DEBUG: logging salt discovery to isolate Step 5 → Step 4 regression.
+Passphrase via X-Livesync-Passphrase HTTP header, with LIVESYNC_PASSPHRASE
+env var as fallback. PBKDF2 salt auto-discovered from CouchDB at startup.
 
 Agents connect at: http://<host>:8000/mcp (StreamableHTTP)
 """
@@ -14,68 +15,84 @@ import os
 import sys
 from typing import Optional
 
-logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
-
 os.environ["FASTMCP_HOST"] = os.environ.get("MCP_HOST", "0.0.0.0")
 os.environ["FASTMCP_PORT"] = os.environ.get("MCP_PORT", "8000")
 
 from obsidian_self_mcp.server import mcp, _get_client
 from obsidian_self_mcp.client import ObsidianVaultClient
 
+# ── Per-request passphrase (ContextVar, set by middleware) ─────────
+
 passphrase_ctx = contextvars.ContextVar("livesync_passphrase", default="")
+
+# ── Global salt (discovered once at startup) ──────────────────────
 
 _pbkdf2_salt: Optional[str] = None
 
 
 def _get_passphrase() -> str:
+    """Return passphrase: ContextVar first (from header), then env var fallback."""
     return passphrase_ctx.get() or os.environ.get("LIVESYNC_PASSPHRASE", "")
 
 
-# ── Middleware ─────────────────────────────────────────────────────
+# ── ASGI middleware: extract passphrase from HTTP header ───────────
+#
+# Uses a raw ASGI wrapper (not BaseHTTPMiddleware) to avoid breaking
+# the SSE streaming used by StreamableHTTP session establishment.
+# Manual wrapping (app = middleware(app)) instead of add_middleware().
 
 
 def _header_middleware(app):
+    """Wrap an ASGI app to extract X-Livesync-Passphrase header per request."""
+
     async def wrapper(scope, receive, send):
         if scope["type"] != "http":
             await app(scope, receive, send)
             return
+
         headers = dict(scope.get("headers", []))
         passphrase_bytes = headers.get(b"x-livesync-passphrase", b"")
         passphrase = passphrase_bytes.decode() if passphrase_bytes else ""
+
         token = passphrase_ctx.set(passphrase)
         try:
             await app(scope, receive, send)
         finally:
             passphrase_ctx.reset(token)
+
     return wrapper
 
 
-# ── Salt discovery ─────────────────────────────────────────────────
+# ── Salt discovery (always runs at startup) ────────────────────────
 
 async def _discover_pbkdf2_salt() -> Optional[str]:
+    """Find PBKDF2 salt from CouchDB sync params document (base64-encoded)."""
     import base64
-    logging.debug("_discover_pbkdf2_salt: calling _get_client()")
+
     vault_client = _get_client()
     http = await vault_client._get_client()
-    logging.debug("_discover_pbkdf2_salt: GET _local/obsidian_livesync_sync_parameters")
     resp = await http.get("_local/obsidian_livesync_sync_parameters")
-    logging.debug("_discover_pbkdf2_salt: status=%s", resp.status_code)
     if resp.status_code != 200:
+        logging.warning("Sync params doc not found (status %s)", resp.status_code)
         return None
     doc = resp.json()
     salt_b64 = doc.get("pbkdf2salt", "")
-    logging.debug("_discover_pbkdf2_salt: salt_b64=%s...", salt_b64[:20] if salt_b64 else "(none)")
     if not salt_b64:
+        logging.warning("pbkdf2salt field not found in sync params")
         return None
-    return base64.b64decode(salt_b64).hex()
+    salt_bytes = base64.b64decode(salt_b64)
+    return salt_bytes.hex()
 
 
-# ── Patches ────────────────────────────────────────────────────────
+# ── Patch _fetch_chunks for decryption ─────────────────────────────
+
 
 async def _patched_fetch_chunks(self, chunk_ids):
     httpx_client = await self._get_client()
     resp = await httpx_client.post(
-        "/_all_docs", json={"keys": chunk_ids}, params={"include_docs": "true"}
+        "/_all_docs",
+        json={"keys": chunk_ids},
+        params={"include_docs": "true"},
     )
     resp.raise_for_status()
     result = {}
@@ -87,104 +104,169 @@ async def _patched_fetch_chunks(self, chunk_ids):
             if doc.get("e_"):
                 if passphrase and _pbkdf2_salt:
                     from livesync_decrypt import decrypt_chunk
+
                     try:
                         data = decrypt_chunk(data, passphrase, _pbkdf2_salt)
                     except Exception as e:
                         data = f"[DECRYPT FAILED: {e}]"
-                        logging.warning("Decrypt failed for chunk %s: %s", row["id"], e)
+                        logging.warning(
+                            "Decrypt failed for chunk %s: %s", row["id"], e
+                        )
                 else:
-                    data = "[ENCRYPTED — set passphrase (header or env)]"
+                    data = (
+                        "[ENCRYPTED — set X-Livesync-Passphrase header"
+                        " or LIVESYNC_PASSPHRASE env var]"
+                    )
             result[row["id"]] = data
     return result
 
+
 ObsidianVaultClient._fetch_chunks = _patched_fetch_chunks
 
+
+# ── Patch _get_all_file_docs for deduplication ─────────────────────
+
+# LiveSync internal metadata prefixes (from livesync-commonlib constants)
 _LIVESYNC_INTERNAL_PREFIXES = ("i:", "ps:", "ix:", "_design/", "_local/")
 
+
 async def _patched_get_all_file_docs(self):
+    """Fetch all file docs (skip chunks, design docs, index docs).
+
+    Patched to:
+    1. Exclude LiveSync internal metadata prefixes (i:, ps:, ix:)
+    2. Exclude CouchDB system docs (_design/, _local/)
+    3. Exclude deleted documents
+    4. Deduplicate by path — keeps the entry with the highest mtime
+    """
     httpx_client = await self._get_client()
+
     all_rows = []
+
+    # Range 1: docs before "h:" (excludes all chunk IDs)
     resp = await httpx_client.get(
         "/_all_docs",
-        params={"include_docs": "true", "endkey": '"h:"', "inclusive_end": "false"},
+        params={
+            "include_docs": "true",
+            "endkey": '"h:"',
+            "inclusive_end": "false",
+        },
     )
     resp.raise_for_status()
     all_rows.extend(resp.json().get("rows", []))
+
+    # Range 2: docs after "h:~" (after all possible chunk IDs)
     resp = await httpx_client.get(
-        "/_all_docs", params={"include_docs": "true", "startkey": '"h:~"'},
+        "/_all_docs",
+        params={
+            "include_docs": "true",
+            "startkey": '"h:~"',
+        },
     )
     resp.raise_for_status()
     all_rows.extend(resp.json().get("rows", []))
+
+    # Process with deduplication by path
     seen: dict[str, dict] = {}
+    skipped_deleted = 0
+    skipped_internal = 0
+    skipped_duplicate = 0
+
     for row in all_rows:
         doc = row.get("doc")
         if not doc:
             continue
+
+        # Skip deleted documents (check both doc._deleted and row.value.deleted)
         if doc.get("_deleted") or row.get("value", {}).get("deleted"):
+            skipped_deleted += 1
             continue
+
+        # Skip non-file docs (must have type and children)
         if doc.get("type") not in ("plain", "newnote") or "children" not in doc:
             continue
+
         doc_id = doc.get("_id", "")
+
+        # Skip LiveSync internal metadata and CouchDB system docs
         if any(doc_id.startswith(p) for p in _LIVESYNC_INTERNAL_PREFIXES):
+            skipped_internal += 1
             continue
+
+        # Deduplicate by path — keep the most recent mtime
         path = doc.get("path", doc_id)
         existing = seen.get(path)
         if existing is None or doc.get("mtime", 0) > existing.get("mtime", 0):
+            if existing is not None:
+                skipped_duplicate += 1
             seen[path] = doc
+        else:
+            skipped_duplicate += 1
+
+    if skipped_deleted or skipped_internal or skipped_duplicate:
+        logging.info(
+            "_get_all_file_docs: filtered %d deleted, %d internal, "
+            "%d duplicate path(s) — %d unique file docs remain",
+            skipped_deleted,
+            skipped_internal,
+            skipped_duplicate,
+            len(seen),
+        )
+
     return list(seen.values())
+
 
 ObsidianVaultClient._get_all_file_docs = _patched_get_all_file_docs
 
 
-# ── Startup ────────────────────────────────────────────────────────
+# ── Startup: always discover salt, regardless of passphrase source ─
 
 async def _startup():
+    """Discover PBKDF2 salt, build and return the ASGI app."""
     global _pbkdf2_salt
-    logging.debug("_startup: begin")
 
     salt = os.environ.get("LIVESYNC_PBKDF2_SALT", "")
-    logging.debug("_startup: LIVESYNC_PBKDF2_SALT=%s", salt[:10] if salt else "(not set)")
     if not salt:
-        logging.debug("_startup: entering salt discovery loop")
+        print("Discovering PBKDF2 salt from CouchDB...", file=sys.stderr, flush=True)
         for attempt in range(1, 8):
             await asyncio.sleep(3)
             try:
                 salt = await _discover_pbkdf2_salt()
                 if salt:
-                    logging.debug("_startup: salt discovered on attempt %d", attempt)
                     break
             except Exception as e:
-                logging.debug("_startup: attempt %d failed: %s", attempt, e)
+                print(f"  Attempt {attempt}/7: {e}", file=sys.stderr, flush=True)
 
     if salt:
         _pbkdf2_salt = salt
-        logging.debug("_startup: _pbkdf2_salt set, len=%d", len(salt))
         print("Salt discovered. Vault ready.", file=sys.stderr, flush=True)
     else:
-        logging.warning("_startup: salt NOT discovered")
+        print(
+            "WARNING: Could not discover PBKDF2 salt. "
+            "Set LIVESYNC_PBKDF2_SALT if encryption is used.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     try:
         mcp.settings.transport_security.enable_dns_rebinding_protection = False
     except AttributeError:
         pass
 
-    logging.debug("_startup: calling mcp.streamable_http_app()")
-    app = mcp.streamable_http_app()
-    logging.debug("_startup: app created, type=%s", type(app).__name__)
-    return app
+    return mcp.streamable_http_app()
 
 
 if __name__ == "__main__":
     import uvicorn
+
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("MCP_PORT", "8000"))
-    logging.debug("main: calling asyncio.run(_startup())")
+
     app = asyncio.run(_startup())
-    logging.debug("main: wrapping with _header_middleware")
     app = _header_middleware(app)
-    logging.debug("main: calling uvicorn.run")
+
     print(
-        f"Obsidian MCP server on {host}:{port}/mcp (DEBUG: salt discovery logging)",
+        f"Obsidian MCP server starting on {host}:{port}/mcp (StreamableHTTP + header auth)",
         file=sys.stderr,
     )
     uvicorn.run(app, host=host, port=port, proxy_headers=False, log_level="info")
