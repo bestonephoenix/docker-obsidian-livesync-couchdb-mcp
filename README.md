@@ -73,7 +73,7 @@ What happens at container startup:
 
 The passphrase never leaves the Docker host. No HTTP headers, no query params, no agent tools — the agent never sees or handles it.
 
-> **Planned (Phase 2):** Move the passphrase from Docker env var to Hermes config `headers` (e.g. `X-Livesync-Passphrase`), removing it from the compose file entirely. StreamableHTTP transport already supports custom header forwarding — blocked by [GH-5](https://github.com/bestonephoenix/docker-obsidian-livesync-couchdb-mcp/issues/5).
+> **Planned (Phase 2):** Move the passphrase from Docker env var to Hermes config `headers` (e.g. `X-Livesync-Passphrase`), removing it from the compose file entirely. StreamableHTTP transport already supports custom header forwarding. See [PHASE2.md](PHASE2.md).
 
 ### How salt discovery works
 
@@ -171,7 +171,7 @@ Key derivation parameters match LiveSync's `octagonal-wheels/hkdf.ts` exactly.
 ## Roadmap
 
 - [x] **Phase 1:** StreamableHTTP transport (completed May 2026)
-- [ ] **Phase 2:** Passphrase via HTTP header (`X-Livesync-Passphrase`) instead of Docker env var — see [GH-5](https://github.com/bestonephoenix/docker-obsidian-livesync-couchdb-mcp/issues/5)
+- [ ] **Phase 2:** Passphrase via HTTP header (`X-Livesync-Passphrase`) instead of Docker env var — see [PHASE2.md](PHASE2.md)
 
 ## What this builds on
 
