@@ -26,10 +26,10 @@ RUN python3 -m venv /opt/venv && \
 
 # ── Our files ──────────────────────────────────────────────────────────
 COPY livesync_decrypt.py /scripts/livesync_decrypt.py
-COPY mcp_sse_server.py /scripts/mcp_sse_server.py
+COPY mcp_server.py /scripts/mcp_server.py
 COPY supervisord.conf /etc/supervisor/conf.d/obsidian.conf
 
 EXPOSE 5984 8000
 
-# supervisord runs both CouchDB and the MCP SSE server
+# supervisord runs both CouchDB and the MCP StreamableHTTP server
 CMD ["/usr/bin/supervisord", "-n", "-c", "/etc/supervisor/supervisord.conf"]
