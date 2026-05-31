@@ -2,7 +2,8 @@
 """
 MCP StreamableHTTP server for Obsidian vault access via CouchDB LiveSync.
 
-Passphrase via LIVESYNC_PASSPHRASE env var (header support: WIP).
+Passphrase via X-Livesync-Passphrase HTTP header, with LIVESYNC_PASSPHRASE
+env var as fallback.
 
 Agents connect at: http://<host>:8000/mcp (StreamableHTTP)
 """
@@ -29,16 +30,24 @@ def _get_passphrase() -> str:
     return passphrase_ctx.get() or os.environ.get("LIVESYNC_PASSPHRASE", "")
 
 
-# ── Step 3: HTTP-type check only, no ContextVar ops ────────────────
+# ── Step 4: full middleware (ContextVar set/reset added) ───────────
 
 
-def _passthrough_middleware(app):
+def _header_middleware(app):
     async def wrapper(scope, receive, send):
         if scope["type"] != "http":
             await app(scope, receive, send)
             return
-        # TODO: extract header → passphrase_ctx.set()
-        await app(scope, receive, send)
+
+        headers = dict(scope.get("headers", []))
+        passphrase_bytes = headers.get(b"x-livesync-passphrase", b"")
+        passphrase = passphrase_bytes.decode() if passphrase_bytes else ""
+
+        token = passphrase_ctx.set(passphrase)
+        try:
+            await app(scope, receive, send)
+        finally:
+            passphrase_ctx.reset(token)
 
     return wrapper
 
@@ -183,9 +192,9 @@ if __name__ == "__main__":
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("MCP_PORT", "8000"))
     app = asyncio.run(_startup())
-    app = _passthrough_middleware(app)
+    app = _header_middleware(app)
     print(
-        f"Obsidian MCP server on {host}:{port}/mcp (Step 3: http-check only)",
+        f"Obsidian MCP server on {host}:{port}/mcp (Step 4: full middleware)",
         file=sys.stderr,
     )
     uvicorn.run(app, host=host, port=port, proxy_headers=False, log_level="info")
