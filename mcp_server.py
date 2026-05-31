@@ -36,10 +36,6 @@ def _get_passphrase() -> str:
 
 
 # ── ASGI middleware: extract passphrase from HTTP header ───────────
-#
-# Uses a raw ASGI wrapper (not BaseHTTPMiddleware) to avoid breaking
-# the SSE streaming used by StreamableHTTP session establishment.
-# Manual wrapping (app = middleware(app)) instead of add_middleware().
 
 
 def _header_middleware(app):
@@ -124,9 +120,8 @@ async def _patched_fetch_chunks(self, chunk_ids):
 ObsidianVaultClient._fetch_chunks = _patched_fetch_chunks
 
 
-# ── Patch _get_all_file_docs for deduplication ─────────────────────
+# ── Patch _get_all_file_docs for deduplication & ghost filtering ───
 
-# LiveSync internal metadata prefixes (from livesync-commonlib constants)
 _LIVESYNC_INTERNAL_PREFIXES = ("i:", "ps:", "ix:", "_design/", "_local/")
 
 
@@ -137,7 +132,8 @@ async def _patched_get_all_file_docs(self):
     1. Exclude LiveSync internal metadata prefixes (i:, ps:, ix:)
     2. Exclude CouchDB system docs (_design/, _local/)
     3. Exclude deleted documents
-    4. Deduplicate by path — keeps the entry with the highest mtime
+    4. Exclude ghost files (empty children — parent doc with zero chunks)
+    5. Deduplicate by path — keeps the entry with the highest mtime
     """
     httpx_client = await self._get_client()
 
@@ -170,6 +166,7 @@ async def _patched_get_all_file_docs(self):
     seen: dict[str, dict] = {}
     skipped_deleted = 0
     skipped_internal = 0
+    skipped_ghost = 0
     skipped_duplicate = 0
 
     for row in all_rows:
@@ -184,6 +181,12 @@ async def _patched_get_all_file_docs(self):
 
         # Skip non-file docs (must have type and children)
         if doc.get("type") not in ("plain", "newnote") or "children" not in doc:
+            continue
+
+        # Skip ghost files (parent doc with zero chunks — orphaned entry)
+        if not doc.get("children"):
+            skipped_ghost += 1
+            logging.debug("Ghost: skipping %s (empty children)", doc.get("_id", "?"))
             continue
 
         doc_id = doc.get("_id", "")
@@ -203,12 +206,13 @@ async def _patched_get_all_file_docs(self):
         else:
             skipped_duplicate += 1
 
-    if skipped_deleted or skipped_internal or skipped_duplicate:
+    if skipped_deleted or skipped_internal or skipped_ghost or skipped_duplicate:
         logging.info(
             "_get_all_file_docs: filtered %d deleted, %d internal, "
-            "%d duplicate path(s) — %d unique file docs remain",
+            "%d ghost, %d duplicate — %d unique file docs remain",
             skipped_deleted,
             skipped_internal,
+            skipped_ghost,
             skipped_duplicate,
             len(seen),
         )
