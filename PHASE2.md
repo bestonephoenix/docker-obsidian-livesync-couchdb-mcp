@@ -1,62 +1,55 @@
-# Phase 2: Header-based passphrase
+# Phase 2: Header-based passphrase ✅ COMPLETED
 
-## Goal
+**Completed:** May 31, 2026
 
-Move `LIVESYNC_PASSPHRASE` from Docker environment variable to Hermes config HTTP header, removing it from the compose file entirely.
+## What changed
 
-## Current state (Phase 1)
+Passphrase can now be provided via HTTP header (`X-Livesync-Passphrase`) instead of (or in addition to) the Docker environment variable.
+
+## How it works
 
 ```
-.env → docker-compose.yml → container env → os.environ → _credentials dict
+Hermes config            MCP server
+─────────────            ──────────
+headers:                 _header_middleware
+  X-Livesync-            extracts header
+  Passphrase: "..."  →   stores in ContextVar
+                         (per-request,
+                          async-safe)
+                              │
+                              ▼
+                         _get_passphrase()
+                         ContextVar first,
+                         env var fallback
+                              │
+                              ▼
+                         _patched_fetch_chunks
+                         decrypts chunks
 ```
 
-Passphrase lives in `.env` and is mounted into the container at startup. Works but the secret is in Docker's environment space.
-
-## Target state (Phase 2)
+## Hermes config
 
 ```yaml
-# ~/.hermes/config.yaml
 mcp_servers:
   obsidian:
     url: "http://host:8000/mcp"
+    timeout: 120
     headers:
       X-Livesync-Passphrase: "your-passphrase"
 ```
 
-Hermes forwards custom `headers` with every StreamableHTTP request. The passphrase lives only in Hermes config — never touches Docker.
+The `LIVESYNC_PASSPHRASE` env var in docker-compose.yml remains as a fallback — both methods work.
 
-## Implementation
+## Technical details
 
-### Server-side (mcp_server.py)
+- **Middleware:** Raw ASGI wrapper (not BaseHTTPMiddleware) to avoid breaking SSE streaming
+- **Context isolation:** `contextvars.ContextVar` — thread-safe, async-safe, per-request
+- **Salt discovery:** Always runs at startup, decoupled from passphrase source
+- **App wrapping:** Manual `app = middleware(app)` — avoids Starlette middleware stack conflicts
 
-1. **Add middleware** — Starlette `BaseHTTPMiddleware` that extracts `X-Livesync-Passphrase` from POST request headers
-2. **ContextVar** — store per-request passphrase in `contextvars.ContextVar` (async-safe, per-request isolation)
-3. **Update decryption patch** — `_patched_fetch_chunks` reads from ContextVar instead of module-level `_credentials` dict
-4. **Keep env var fallback** — if no header, fall back to `LIVESYNC_PASSPHRASE` env var for backward compat
-5. **Salt discovery** — PBKDF2 salt still discovered from CouchDB at startup (unchanged)
+## Lessons learned
 
-### Client-side (Hermes config)
-
-```yaml
-mcp_servers:
-  obsidian:
-    url: "http://couchdb-obsidian-livesync:8000/mcp"
-    timeout: 120
-    headers:
-      X-Livesync-Passphrase: "${LIVESYNC_PASSPHRASE}"
-```
-
-### After verification
-
-- Remove `LIVESYNC_PASSPHRASE` from `docker-compose.yml` and `.env.example`
-- Update README to document the header approach as primary
-- Keep env var as fallback path in code
-
-## Risk
-
-ContextVar propagation through FastMCP's internal asyncio task structure needs verification. MCP tools are called from POST handlers — ContextVars should propagate within the same asyncio task, but FastMCP may spawn sub-tasks for tool execution.
-
-## Prerequisites
-
-- [x] StreamableHTTP transport (Phase 1 completed May 2026)
-- [x] Hermes supports `headers` in MCP server config (confirmed in `native-mcp` skill — StreamableHTTP forwards custom headers with every request)
+1. **BaseHTTPMiddleware breaks SSE** — it reads the full response body, which kills the long-lived GET stream used by StreamableHTTP session establishment
+2. **add_middleware() interacts poorly with FastMCP** — FastMCP pre-builds its Starlette middleware stack; adding to it post-creation causes routing issues
+3. **Proxy issues can masquerade as code bugs** — always test directly before debugging code
+4. **Salt discovery must be decoupled from passphrase** — the salt is a vault-level property, independent of how the passphrase arrives
