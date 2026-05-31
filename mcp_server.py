@@ -37,35 +37,27 @@ def _get_passphrase() -> str:
     return passphrase_ctx.get() or os.environ.get("LIVESYNC_PASSPHRASE", "")
 
 
-# ── Middleware: extract passphrase from HTTP header ────────────────
-#
-# IMPORTANT: Raw ASGI middleware, NOT BaseHTTPMiddleware.
-# BaseHTTPMiddleware breaks SSE streaming (GET → session establishment)
-# because it reads the full response body. Raw ASGI delegates directly
-# to the inner app without touching the response stream.
+# ── ASGI middleware: extract passphrase from HTTP header ───────────
 
+def _passphrase_middleware(app):
+    """Wrap an ASGI app to extract X-Livesync-Passphrase into a ContextVar."""
 
-class PassphraseMiddleware:
-    """Extract X-Livesync-Passphrase header into ContextVar for the request."""
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
+    async def asgi_wrapper(scope, receive, send):
         if scope["type"] != "http":
-            await self.app(scope, receive, send)
+            await app(scope, receive, send)
             return
 
-        # Extract passphrase from raw ASGI headers (bytes)
         headers = dict(scope.get("headers", []))
         passphrase_bytes = headers.get(b"x-livesync-passphrase", b"")
         passphrase = passphrase_bytes.decode() if passphrase_bytes else ""
 
         token = passphrase_ctx.set(passphrase)
         try:
-            await self.app(scope, receive, send)
+            await app(scope, receive, send)
         finally:
             passphrase_ctx.reset(token)
+
+    return asgi_wrapper
 
 
 # ── Auto-discover PBKDF2 salt from CouchDB ────────────────────────
@@ -129,7 +121,7 @@ ObsidianVaultClient._fetch_chunks = _patched_fetch_chunks
 # ── Startup (async — handles retry for CouchDB readiness) ─────────
 
 async def _startup():
-    """Discover PBKDF2 salt, build app with passphrase middleware."""
+    """Discover PBKDF2 salt, build app."""
     global _pbkdf2_salt
 
     # Try explicit salt first, then auto-discover from CouchDB
@@ -161,9 +153,7 @@ async def _startup():
     except AttributeError:
         pass
 
-    app = mcp.streamable_http_app()
-    app.add_middleware(PassphraseMiddleware)
-    return app
+    return mcp.streamable_http_app()
 
 
 if __name__ == "__main__":
@@ -173,6 +163,9 @@ if __name__ == "__main__":
     port = int(os.environ.get("MCP_PORT", "8000"))
 
     app = asyncio.run(_startup())
+    # Wrap manually — avoids add_middleware() interfering with
+    # Starlette's internal middleware stack that FastMCP has already built
+    app = _passphrase_middleware(app)
 
     print(
         f"Obsidian MCP server starting on {host}:{port}/mcp"
