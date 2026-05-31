@@ -120,7 +120,7 @@ async def _patched_fetch_chunks(self, chunk_ids):
 ObsidianVaultClient._fetch_chunks = _patched_fetch_chunks
 
 
-# ── Patch _get_all_file_docs for deduplication & ghost filtering ───
+# ── Patch _get_all_file_docs: dedup by filename, filter ghosts ────
 
 _LIVESYNC_INTERNAL_PREFIXES = ("i:", "ps:", "ix:", "_design/", "_local/")
 
@@ -133,7 +133,9 @@ async def _patched_get_all_file_docs(self):
     2. Exclude CouchDB system docs (_design/, _local/)
     3. Exclude deleted documents
     4. Exclude ghost files (empty children — parent doc with zero chunks)
-    5. Deduplicate by path — keeps the entry with the highest mtime
+    5. Deduplicate by base filename — keeps the entry with the highest mtime.
+       This handles files that were moved between folders (root → subfolder)
+       where the old CouchDB doc with the old path persists alongside the new one.
     """
     httpx_client = await self._get_client()
 
@@ -162,7 +164,7 @@ async def _patched_get_all_file_docs(self):
     resp.raise_for_status()
     all_rows.extend(resp.json().get("rows", []))
 
-    # Process with deduplication by path
+    # Process with deduplication by base filename
     seen: dict[str, dict] = {}
     skipped_deleted = 0
     skipped_internal = 0
@@ -186,7 +188,6 @@ async def _patched_get_all_file_docs(self):
         # Skip ghost files (parent doc with zero chunks — orphaned entry)
         if not doc.get("children"):
             skipped_ghost += 1
-            logging.debug("Ghost: skipping %s (empty children)", doc.get("_id", "?"))
             continue
 
         doc_id = doc.get("_id", "")
@@ -196,13 +197,24 @@ async def _patched_get_all_file_docs(self):
             skipped_internal += 1
             continue
 
-        # Deduplicate by path — keep the most recent mtime
+        # Deduplicate by base filename, keep highest mtime.
+        # Uses filename (last path segment) as the dedup key so files
+        # moved between folders (e.g. root → subfolder) collapse to one entry.
         path = doc.get("path", doc_id)
-        existing = seen.get(path)
+        filename = path.rsplit("/", 1)[-1]
+
+        existing = seen.get(filename)
         if existing is None or doc.get("mtime", 0) > existing.get("mtime", 0):
             if existing is not None:
                 skipped_duplicate += 1
-            seen[path] = doc
+                logging.debug(
+                    "Dedup: keeping %s over %s (mtime %s > %s)",
+                    path,
+                    existing.get("path", existing.get("_id")),
+                    doc.get("mtime"),
+                    existing.get("mtime"),
+                )
+            seen[filename] = doc
         else:
             skipped_duplicate += 1
 
