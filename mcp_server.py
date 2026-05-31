@@ -2,7 +2,7 @@
 """
 MCP StreamableHTTP server for Obsidian vault access via CouchDB LiveSync.
 
-Passphrase via LIVESYNC_PASSPHRASE env var only.
+Passphrase via X-Livesync-Passphrase HTTP header (or LIVESYNC_PASSPHRASE env var fallback).
 PBKDF2 salt auto-discovered from CouchDB at startup with retry.
 No passphrase ever touches the agent.
 
@@ -10,6 +10,7 @@ Agents connect at: http://<host>:8000/mcp (StreamableHTTP)
 """
 
 import asyncio
+import contextvars
 import logging
 import os
 import sys
@@ -19,12 +20,37 @@ from typing import Optional
 os.environ["FASTMCP_HOST"] = os.environ.get("MCP_HOST", "0.0.0.0")
 os.environ["FASTMCP_PORT"] = os.environ.get("MCP_PORT", "8000")
 
+from starlette.middleware.base import BaseHTTPMiddleware
 from obsidian_self_mcp.server import mcp, _get_client
 from obsidian_self_mcp.client import ObsidianVaultClient
 
-# ── Session state ──────────────────────────────────────────────────
+# ── Per-request passphrase (ContextVar, set by middleware) ─────────
 
-_credentials: dict = {}
+passphrase_ctx = contextvars.ContextVar("livesync_passphrase", default="")
+
+# ── Global salt (discovered once at startup) ──────────────────────
+
+_pbkdf2_salt: Optional[str] = None
+
+
+def _get_passphrase() -> str:
+    """Return passphrase from request header, falling back to env var."""
+    return passphrase_ctx.get() or os.environ.get("LIVESYNC_PASSPHRASE", "")
+
+
+# ── Middleware: extract passphrase from HTTP header ────────────────
+
+class PassphraseMiddleware(BaseHTTPMiddleware):
+    """Extract X-Livesync-Passphrase header into ContextVar for the request."""
+
+    async def dispatch(self, request, call_next):
+        passphrase = request.headers.get("X-Livesync-Passphrase", "")
+        token = passphrase_ctx.set(passphrase)
+        try:
+            response = await call_next(request)
+            return response
+        finally:
+            passphrase_ctx.reset(token)
 
 
 # ── Auto-discover PBKDF2 salt from CouchDB ────────────────────────
@@ -60,24 +86,24 @@ async def _patched_fetch_chunks(self, chunk_ids):
     )
     resp.raise_for_status()
     result = {}
+    passphrase = _get_passphrase()
     for row in resp.json().get("rows", []):
         doc = row.get("doc")
         if doc and "data" in doc:
             data = doc["data"]
             if doc.get("e_"):
-                if _credentials:
+                if passphrase and _pbkdf2_salt:
                     from livesync_decrypt import decrypt_chunk
                     try:
-                        data = decrypt_chunk(
-                            data,
-                            _credentials["passphrase"],
-                            _credentials["pbkdf2_salt"],
-                        )
+                        data = decrypt_chunk(data, passphrase, _pbkdf2_salt)
                     except Exception as e:
                         data = f"[DECRYPT FAILED: {e}]"
                         logging.warning("Decrypt failed for chunk %s: %s", row["id"], e)
                 else:
-                    data = "[ENCRYPTED — restart container with LIVESYNC_PASSPHRASE]"
+                    data = (
+                        "[ENCRYPTED — set X-Livesync-Passphrase header"
+                        " or LIVESYNC_PASSPHRASE env var]"
+                    )
             result[row["id"]] = data
     return result
 
@@ -88,45 +114,41 @@ ObsidianVaultClient._fetch_chunks = _patched_fetch_chunks
 # ── Startup (async — handles retry for CouchDB readiness) ─────────
 
 async def _startup():
-    """Discover salt, unlock vault."""
-    global _credentials
+    """Discover PBKDF2 salt, build app with passphrase middleware."""
+    global _pbkdf2_salt
 
-    passphrase = os.environ.get("LIVESYNC_PASSPHRASE", "")
-    if passphrase:
-        salt = os.environ.get("LIVESYNC_PBKDF2_SALT", "")
-        if not salt:
-            print("Waiting for CouchDB...", file=sys.stderr, flush=True)
-            for attempt in range(1, 8):
-                await asyncio.sleep(3)
-                try:
-                    salt = await _discover_pbkdf2_salt()
-                    if salt:
-                        break
-                except Exception as e:
-                    print(f"  Attempt {attempt}/7: {e}", file=sys.stderr, flush=True)
-            else:
-                salt = None
+    # Try explicit salt first, then auto-discover from CouchDB
+    salt = os.environ.get("LIVESYNC_PBKDF2_SALT", "")
+    if not salt:
+        print("Discovering PBKDF2 salt from CouchDB...", file=sys.stderr, flush=True)
+        for attempt in range(1, 8):
+            await asyncio.sleep(3)
+            try:
+                salt = await _discover_pbkdf2_salt()
+                if salt:
+                    break
+            except Exception as e:
+                print(f"  Attempt {attempt}/7: {e}", file=sys.stderr, flush=True)
 
-        if salt:
-            _credentials = {"passphrase": passphrase, "pbkdf2_salt": salt}
-            print("Vault UNLOCKED.", file=sys.stderr, flush=True)
-        else:
-            print(
-                "WARNING: Could not discover PBKDF2 salt. "
-                "Set LIVESYNC_PBKDF2_SALT if needed.",
-                file=sys.stderr,
-                flush=True,
-            )
+    if salt:
+        _pbkdf2_salt = salt
+        print("Salt discovered. Vault ready.", file=sys.stderr, flush=True)
     else:
-        # Unencrypted vault — nothing to do, works out of the box
-        pass
+        print(
+            "WARNING: Could not discover PBKDF2 salt. "
+            "Set LIVESYNC_PBKDF2_SALT if encryption is used.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     try:
         mcp.settings.transport_security.enable_dns_rebinding_protection = False
     except AttributeError:
         pass
 
-    return mcp.streamable_http_app()
+    app = mcp.streamable_http_app()
+    app.add_middleware(PassphraseMiddleware)
+    return app
 
 
 if __name__ == "__main__":
@@ -138,7 +160,8 @@ if __name__ == "__main__":
     app = asyncio.run(_startup())
 
     print(
-        f"Obsidian MCP server starting on {host}:{port}/mcp (StreamableHTTP)",
+        f"Obsidian MCP server starting on {host}:{port}/mcp"
+        " (StreamableHTTP + header auth)",
         file=sys.stderr,
     )
     uvicorn.run(app, host=host, port=port, proxy_headers=False, log_level="info")
