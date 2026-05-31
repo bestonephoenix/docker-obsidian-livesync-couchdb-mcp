@@ -20,7 +20,6 @@ from typing import Optional
 os.environ["FASTMCP_HOST"] = os.environ.get("MCP_HOST", "0.0.0.0")
 os.environ["FASTMCP_PORT"] = os.environ.get("MCP_PORT", "8000")
 
-from starlette.middleware.base import BaseHTTPMiddleware
 from obsidian_self_mcp.server import mcp, _get_client
 from obsidian_self_mcp.client import ObsidianVaultClient
 
@@ -39,16 +38,32 @@ def _get_passphrase() -> str:
 
 
 # ── Middleware: extract passphrase from HTTP header ────────────────
+#
+# IMPORTANT: Raw ASGI middleware, NOT BaseHTTPMiddleware.
+# BaseHTTPMiddleware breaks SSE streaming (GET → session establishment)
+# because it reads the full response body. Raw ASGI delegates directly
+# to the inner app without touching the response stream.
 
-class PassphraseMiddleware(BaseHTTPMiddleware):
+
+class PassphraseMiddleware:
     """Extract X-Livesync-Passphrase header into ContextVar for the request."""
 
-    async def dispatch(self, request, call_next):
-        passphrase = request.headers.get("X-Livesync-Passphrase", "")
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # Extract passphrase from raw ASGI headers (bytes)
+        headers = dict(scope.get("headers", []))
+        passphrase_bytes = headers.get(b"x-livesync-passphrase", b"")
+        passphrase = passphrase_bytes.decode() if passphrase_bytes else ""
+
         token = passphrase_ctx.set(passphrase)
         try:
-            response = await call_next(request)
-            return response
+            await self.app(scope, receive, send)
         finally:
             passphrase_ctx.reset(token)
 
@@ -109,118 +124,6 @@ async def _patched_fetch_chunks(self, chunk_ids):
 
 
 ObsidianVaultClient._fetch_chunks = _patched_fetch_chunks
-
-
-# ── Patch _get_all_file_docs for deduplication ─────────────────────
-
-# LiveSync internal metadata prefixes (from livesync-commonlib constants)
-_LIVESYNC_INTERNAL_PREFIXES = ("i:", "ps:", "ix:", "_design/", "_local/")
-
-
-async def _patched_get_all_file_docs(self):
-    """Fetch all file docs (skip chunks, design docs, index docs).
-
-    Patched to:
-    1. Exclude LiveSync internal metadata prefixes (i:, ps:, ix:)
-    2. Exclude CouchDB system docs (_design/, _local/)
-    3. Exclude deleted documents
-    4. Deduplicate by path — keeps the entry with the highest mtime
-    """
-    httpx_client = await self._get_client()
-
-    all_rows = []
-
-    # Range 1: docs before "h:" (excludes all chunk IDs)
-    resp = await httpx_client.get(
-        "/_all_docs",
-        params={
-            "include_docs": "true",
-            "endkey": '"h:"',
-            "inclusive_end": "false",
-        },
-    )
-    resp.raise_for_status()
-    all_rows.extend(resp.json().get("rows", []))
-
-    # Range 2: docs after "h:~" (after all possible chunk IDs)
-    resp = await httpx_client.get(
-        "/_all_docs",
-        params={
-            "include_docs": "true",
-            "startkey": '"h:~"',
-        },
-    )
-    resp.raise_for_status()
-    all_rows.extend(resp.json().get("rows", []))
-
-    # Process with deduplication by path
-    seen: dict[str, dict] = {}
-    skipped_deleted = 0
-    skipped_internal = 0
-    skipped_duplicate = 0
-
-    for row in all_rows:
-        doc = row.get("doc")
-        if not doc:
-            continue
-
-        # Skip deleted documents (check both doc._deleted and row.value.deleted)
-        if doc.get("_deleted") or row.get("value", {}).get("deleted"):
-            skipped_deleted += 1
-            continue
-
-        # Skip non-file docs (must have type and children)
-        if doc.get("type") not in ("plain", "newnote") or "children" not in doc:
-            continue
-
-        doc_id = doc.get("_id", "")
-
-        # Skip LiveSync internal metadata and CouchDB system docs
-        if any(doc_id.startswith(p) for p in _LIVESYNC_INTERNAL_PREFIXES):
-            skipped_internal += 1
-            continue
-
-        # Deduplicate by path — keep the most recent mtime
-        path = doc.get("path", doc_id)
-        existing = seen.get(path)
-        if existing is None or doc.get("mtime", 0) > existing.get("mtime", 0):
-            if existing is not None:
-                skipped_duplicate += 1
-                logging.debug(
-                    "Dedup: replacing %s (mtime=%s) with %s (mtime=%s) for path %s",
-                    existing.get("_id"),
-                    existing.get("mtime"),
-                    doc_id,
-                    doc.get("mtime"),
-                    path,
-                )
-            seen[path] = doc
-        else:
-            skipped_duplicate += 1
-            logging.debug(
-                "Dedup: skipping stale doc %s (mtime=%s) for path %s, "
-                "keeping %s (mtime=%s)",
-                doc_id,
-                doc.get("mtime"),
-                path,
-                existing.get("_id"),
-                existing.get("mtime"),
-            )
-
-    if skipped_deleted or skipped_internal or skipped_duplicate:
-        logging.info(
-            "_get_all_file_docs: filtered %d deleted, %d internal, "
-            "%d duplicate path(s) — %d unique file docs remain",
-            skipped_deleted,
-            skipped_internal,
-            skipped_duplicate,
-            len(seen),
-        )
-
-    return list(seen.values())
-
-
-ObsidianVaultClient._get_all_file_docs = _patched_get_all_file_docs
 
 
 # ── Startup (async — handles retry for CouchDB readiness) ─────────
