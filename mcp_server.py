@@ -2,7 +2,7 @@
 """
 MCP StreamableHTTP server for Obsidian vault access via CouchDB LiveSync.
 
-Passphrase via X-Livesync-Passphrase HTTP header (or LIVESYNC_PASSPHRASE env var fallback).
+Passphrase via LIVESYNC_PASSPHRASE env var.
 PBKDF2 salt auto-discovered from CouchDB at startup with retry.
 No passphrase ever touches the agent.
 
@@ -10,7 +10,6 @@ Agents connect at: http://<host>:8000/mcp (StreamableHTTP)
 """
 
 import asyncio
-import contextvars
 import logging
 import os
 import sys
@@ -23,41 +22,14 @@ os.environ["FASTMCP_PORT"] = os.environ.get("MCP_PORT", "8000")
 from obsidian_self_mcp.server import mcp, _get_client
 from obsidian_self_mcp.client import ObsidianVaultClient
 
-# ── Per-request passphrase (ContextVar, set by middleware) ─────────
-
-passphrase_ctx = contextvars.ContextVar("livesync_passphrase", default="")
-
 # ── Global salt (discovered once at startup) ──────────────────────
 
 _pbkdf2_salt: Optional[str] = None
 
 
 def _get_passphrase() -> str:
-    """Return passphrase from request header, falling back to env var."""
-    return passphrase_ctx.get() or os.environ.get("LIVESYNC_PASSPHRASE", "")
-
-
-# ── ASGI middleware: extract passphrase from HTTP header ───────────
-
-def _passphrase_middleware(app):
-    """Wrap an ASGI app to extract X-Livesync-Passphrase into a ContextVar."""
-
-    async def asgi_wrapper(scope, receive, send):
-        if scope["type"] != "http":
-            await app(scope, receive, send)
-            return
-
-        headers = dict(scope.get("headers", []))
-        passphrase_bytes = headers.get(b"x-livesync-passphrase", b"")
-        passphrase = passphrase_bytes.decode() if passphrase_bytes else ""
-
-        token = passphrase_ctx.set(passphrase)
-        try:
-            await app(scope, receive, send)
-        finally:
-            passphrase_ctx.reset(token)
-
-    return asgi_wrapper
+    """Return passphrase from env var."""
+    return os.environ.get("LIVESYNC_PASSPHRASE", "")
 
 
 # ── Auto-discover PBKDF2 salt from CouchDB ────────────────────────
@@ -107,10 +79,7 @@ async def _patched_fetch_chunks(self, chunk_ids):
                         data = f"[DECRYPT FAILED: {e}]"
                         logging.warning("Decrypt failed for chunk %s: %s", row["id"], e)
                 else:
-                    data = (
-                        "[ENCRYPTED — set X-Livesync-Passphrase header"
-                        " or LIVESYNC_PASSPHRASE env var]"
-                    )
+                    data = "[ENCRYPTED — set LIVESYNC_PASSPHRASE env var]"
             result[row["id"]] = data
     return result
 
@@ -121,32 +90,38 @@ ObsidianVaultClient._fetch_chunks = _patched_fetch_chunks
 # ── Startup (async — handles retry for CouchDB readiness) ─────────
 
 async def _startup():
-    """Discover PBKDF2 salt, build app."""
+    """Discover PBKDF2 salt, unlock vault."""
     global _pbkdf2_salt
 
-    # Try explicit salt first, then auto-discover from CouchDB
-    salt = os.environ.get("LIVESYNC_PBKDF2_SALT", "")
-    if not salt:
-        print("Discovering PBKDF2 salt from CouchDB...", file=sys.stderr, flush=True)
-        for attempt in range(1, 8):
-            await asyncio.sleep(3)
-            try:
-                salt = await _discover_pbkdf2_salt()
-                if salt:
-                    break
-            except Exception as e:
-                print(f"  Attempt {attempt}/7: {e}", file=sys.stderr, flush=True)
+    passphrase = os.environ.get("LIVESYNC_PASSPHRASE", "")
+    if passphrase:
+        salt = os.environ.get("LIVESYNC_PBKDF2_SALT", "")
+        if not salt:
+            print("Waiting for CouchDB...", file=sys.stderr, flush=True)
+            for attempt in range(1, 8):
+                await asyncio.sleep(3)
+                try:
+                    salt = await _discover_pbkdf2_salt()
+                    if salt:
+                        break
+                except Exception as e:
+                    print(f"  Attempt {attempt}/7: {e}", file=sys.stderr, flush=True)
+            else:
+                salt = None
 
-    if salt:
-        _pbkdf2_salt = salt
-        print("Salt discovered. Vault ready.", file=sys.stderr, flush=True)
+        if salt:
+            _pbkdf2_salt = salt
+            print("Vault UNLOCKED.", file=sys.stderr, flush=True)
+        else:
+            print(
+                "WARNING: Could not discover PBKDF2 salt. "
+                "Set LIVESYNC_PBKDF2_SALT if needed.",
+                file=sys.stderr,
+                flush=True,
+            )
     else:
-        print(
-            "WARNING: Could not discover PBKDF2 salt. "
-            "Set LIVESYNC_PBKDF2_SALT if encryption is used.",
-            file=sys.stderr,
-            flush=True,
-        )
+        # Unencrypted vault — nothing to do, works out of the box
+        pass
 
     try:
         mcp.settings.transport_security.enable_dns_rebinding_protection = False
@@ -163,13 +138,9 @@ if __name__ == "__main__":
     port = int(os.environ.get("MCP_PORT", "8000"))
 
     app = asyncio.run(_startup())
-    # Wrap manually — avoids add_middleware() interfering with
-    # Starlette's internal middleware stack that FastMCP has already built
-    app = _passphrase_middleware(app)
 
     print(
-        f"Obsidian MCP server starting on {host}:{port}/mcp"
-        " (StreamableHTTP + header auth)",
+        f"Obsidian MCP server starting on {host}:{port}/mcp (StreamableHTTP)",
         file=sys.stderr,
     )
     uvicorn.run(app, host=host, port=port, proxy_headers=False, log_level="info")
