@@ -180,6 +180,7 @@ Key derivation parameters match LiveSync's `octagonal-wheels/hkdf.ts` exactly.
 | CouchDB configuration | [oleduc/docker-obsidian-livesync-couchdb](https://github.com/oleduc/docker-obsidian-livesync-couchdb) |
 | MCP tools | [suhasvemuri/obsidian-self-mcp](https://github.com/suhasvemuri/obsidian-self-mcp) |
 | Encryption | Reimplementation of [vrtmrz/octagonal-wheels](https://github.com/vrtmrz/octagonal-wheels) HKDF scheme in Python (`cryptography`) |
+| The original LiveSync Plugin | [vrtmrz/obsidian-livesync](https://github.com/vrtmrz/obsidian-livesync) |
 
 ## Testing
 
