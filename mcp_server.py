@@ -2,10 +2,7 @@
 """
 MCP StreamableHTTP server for Obsidian vault access via CouchDB LiveSync.
 
-Passphrase via X-Livesync-Passphrase HTTP header, with LIVESYNC_PASSPHRASE
-env var as fallback.
-PBKDF2 salt auto-discovered from CouchDB at startup with retry.
-No passphrase ever touches the agent.
+DEBUG: no-op middleware to isolate whether wrapping breaks session management.
 
 Agents connect at: http://<host>:8000/mcp (StreamableHTTP)
 """
@@ -24,7 +21,7 @@ os.environ["FASTMCP_PORT"] = os.environ.get("MCP_PORT", "8000")
 from obsidian_self_mcp.server import mcp, _get_client
 from obsidian_self_mcp.client import ObsidianVaultClient
 
-# ── Per-request passphrase (ContextVar, set by middleware) ─────────
+# ── Per-request passphrase (ContextVar) ────────────────────────────
 
 passphrase_ctx = contextvars.ContextVar("livesync_passphrase", default="")
 
@@ -34,34 +31,20 @@ _pbkdf2_salt: Optional[str] = None
 
 
 def _get_passphrase() -> str:
-    """Return passphrase: ContextVar first (from header), then env var fallback."""
-    return passphrase_ctx.get() or os.environ.get("LIVESYNC_PASSPHRASE", "")
+    """Return passphrase from env var only (middleware disabled for debug)."""
+    return os.environ.get("LIVESYNC_PASSPHRASE", "")
 
 
-# ── ASGI middleware: extract passphrase from HTTP header ───────────
-#
-# Raw ASGI passthrough — does NOT read response body, so SSE streaming
-# (GET /mcp → session establishment) works correctly.
-# BaseHTTPMiddleware is NOT used because it breaks SSE.
+# ── DEBUG: no-op middleware ────────────────────────────────────────
+# Does literally nothing — just passes through. If 404 still happens,
+# app wrapping itself is the problem, not the ContextVar code.
 
 
-def _passphrase_middleware(app):
-    """Wrap an ASGI app to extract X-Livesync-Passphrase header per request."""
+def _noop_middleware(app):
+    """No-op ASGI wrapper — passes scope/receive/send through unchanged."""
 
     async def asgi_wrapper(scope, receive, send):
-        if scope["type"] != "http":
-            await app(scope, receive, send)
-            return
-
-        headers = dict(scope.get("headers", []))
-        passphrase_bytes = headers.get(b"x-livesync-passphrase", b"")
-        passphrase = passphrase_bytes.decode() if passphrase_bytes else ""
-
-        token = passphrase_ctx.set(passphrase)
-        try:
-            await app(scope, receive, send)
-        finally:
-            passphrase_ctx.reset(token)
+        await app(scope, receive, send)
 
     return asgi_wrapper
 
@@ -113,10 +96,7 @@ async def _patched_fetch_chunks(self, chunk_ids):
                         data = f"[DECRYPT FAILED: {e}]"
                         logging.warning("Decrypt failed for chunk %s: %s", row["id"], e)
                 else:
-                    data = (
-                        "[ENCRYPTED — set X-Livesync-Passphrase header"
-                        " or LIVESYNC_PASSPHRASE env var]"
-                    )
+                    data = "[ENCRYPTED — set LIVESYNC_PASSPHRASE env var]"
             result[row["id"]] = data
     return result
 
@@ -126,7 +106,6 @@ ObsidianVaultClient._fetch_chunks = _patched_fetch_chunks
 
 # ── Patch _get_all_file_docs for deduplication ─────────────────────
 
-# LiveSync internal metadata prefixes (from livesync-commonlib constants)
 _LIVESYNC_INTERNAL_PREFIXES = ("i:", "ps:", "ix:", "_design/", "_local/")
 
 
@@ -177,48 +156,27 @@ async def _patched_get_all_file_docs(self):
         if not doc:
             continue
 
-        # Skip deleted documents (check both doc._deleted and row.value.deleted)
         if doc.get("_deleted") or row.get("value", {}).get("deleted"):
             skipped_deleted += 1
             continue
 
-        # Skip non-file docs (must have type and children)
         if doc.get("type") not in ("plain", "newnote") or "children" not in doc:
             continue
 
         doc_id = doc.get("_id", "")
 
-        # Skip LiveSync internal metadata and CouchDB system docs
         if any(doc_id.startswith(p) for p in _LIVESYNC_INTERNAL_PREFIXES):
             skipped_internal += 1
             continue
 
-        # Deduplicate by path — keep the most recent mtime
         path = doc.get("path", doc_id)
         existing = seen.get(path)
         if existing is None or doc.get("mtime", 0) > existing.get("mtime", 0):
             if existing is not None:
                 skipped_duplicate += 1
-                logging.debug(
-                    "Dedup: replacing %s (mtime=%s) with %s (mtime=%s) for path %s",
-                    existing.get("_id"),
-                    existing.get("mtime"),
-                    doc_id,
-                    doc.get("mtime"),
-                    path,
-                )
             seen[path] = doc
         else:
             skipped_duplicate += 1
-            logging.debug(
-                "Dedup: skipping stale doc %s (mtime=%s) for path %s, "
-                "keeping %s (mtime=%s)",
-                doc_id,
-                doc.get("mtime"),
-                path,
-                existing.get("_id"),
-                existing.get("mtime"),
-            )
 
     if skipped_deleted or skipped_internal or skipped_duplicate:
         logging.info(
@@ -269,7 +227,6 @@ async def _startup():
                 flush=True,
             )
     else:
-        # Unencrypted vault — nothing to do, works out of the box
         pass
 
     try:
@@ -287,11 +244,11 @@ if __name__ == "__main__":
     port = int(os.environ.get("MCP_PORT", "8000"))
 
     app = asyncio.run(_startup())
-    app = _passphrase_middleware(app)
+    # DEBUG: wrap with no-op to isolate wrapping vs content issue
+    app = _noop_middleware(app)
 
     print(
-        f"Obsidian MCP server starting on {host}:{port}/mcp"
-        " (StreamableHTTP + header auth)",
+        f"Obsidian MCP server starting on {host}:{port}/mcp (DEBUG: noop middleware)",
         file=sys.stderr,
     )
     uvicorn.run(app, host=host, port=port, proxy_headers=False, log_level="info")
