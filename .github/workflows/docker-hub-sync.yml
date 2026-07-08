@@ -13,20 +13,20 @@ jobs:
   sync-description:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' || github.event_name == 'release'
-    
+
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
-      
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
       - name: Extract short description from README
         id: description
         run: |
           # Extract the first paragraph after the title as short description
           SHORT_DESC=$(sed -n '3p' README.md | sed 's/^This repository/A Docker container that/' | head -c 100)
           echo "short_description=${SHORT_DESC}..." >> $GITHUB_OUTPUT
-      
+
       - name: Update Docker Hub description
-        uses: peter-evans/dockerhub-description@v4
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
