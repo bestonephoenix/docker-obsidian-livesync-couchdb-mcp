@@ -2,6 +2,8 @@
 
 **Single Docker container** running **CouchDB for Obsidian LiveSync** and an **MCP StreamableHTTP server** for AI agent vault access — with end-to-end encryption support.
 
+Obsidian LiveSync clients connect to the Database directly.
+
 Agents (Hermes, Claude Desktop, Cursor, etc.) connect to `http://<host>:8000/mcp` and get full read/write/search access to your vault. Encryption is unlocked via HTTP header or environment variable — zero agent involvement.
 
 ## How it works
